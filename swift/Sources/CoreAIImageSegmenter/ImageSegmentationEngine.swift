@@ -3,6 +3,11 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+// Core AI is in the device and Mac SDKs and not in the simulator's, so this
+// file is what an app cannot compile for a simulator. Guarding it lets the
+// package build there — with this file's contents absent — instead of
+// failing, so an app needs one target rather than two.
+#if canImport(CoreAI)
 import CoreAI
 import CoreAIShared
 import CoreGraphics
@@ -1281,3 +1286,4 @@ public struct CoreAISegmentationEngine {
         return hiddenIndex < tokenEmbedding.count ? tokenEmbedding[hiddenIndex] : 0
     }
 }
+#endif  // canImport(CoreAI)
