@@ -9,6 +9,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from coreai_models.diffusion.components import get_valid_components
 from coreai_models.diffusion.models import get_pipeline_type
@@ -79,9 +80,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resolution",
         default=None,
-        type=int,
-        choices=[512, 1024],
-        help="Output image resolution. Overrides the platform default.",
+        type=str,
+        help="Output image resolution: 512 or 1024 for the square exports, or WxH for any "
+        "other — 1024x768, 768x1024, 1152x864. Both sides must be divisible by 16. "
+        "Anything but the two square sizes implies --single-function, since a resolution "
+        "that is not one of the multi-function asset's entrypoints has to be its own "
+        "asset. Overrides the platform default.",
+    )
+    parser.add_argument(
+        "--reference-grid",
+        default="half",
+        choices=["full", "half", "quarter"],
+        help="Which img2img reference grid a WxH export includes. The reference grid is "
+        "the noise grid divided on both sides, so fewer tokens means faster and lighter "
+        "with coarser guidance. Default: half.",
     )
     parser.add_argument(
         "--low-memory",
@@ -139,6 +151,29 @@ def _is_hf_id(model: str) -> bool:
     return "/" in model
 
 
+def _resolution_size(resolution: str | None, parser: Any) -> tuple[int, int] | None:
+    """`--resolution` as a (width, height), or None for the two square exports.
+
+    512 and 1024 are the multi-function asset's own entrypoints and keep every
+    name they have always had. Anything else — including a square size the
+    model was never traced at — becomes its own set of assets, named after it.
+    """
+    if resolution is None:
+        return None
+    text = str(resolution).lower()
+    if "x" in text:
+        try:
+            width, height = (int(part) for part in text.split("x", 1))
+        except ValueError:
+            parser.error(f"--resolution {resolution} is not a number or WxH.")
+        return (width, height)
+    try:
+        square = int(text)
+    except ValueError:
+        parser.error(f"--resolution {resolution} is not a number or WxH.")
+    return None if square in (512, 1024) else (square, square)
+
+
 def main() -> None:
     """Main entry point for the diffusion export CLI."""
     parser = build_parser()
@@ -194,6 +229,17 @@ def main() -> None:
 
     pipeline_type = get_pipeline_type(hf_model_id)
 
+    # A resolution's components have to exist before --components is checked
+    # against the registry, so the size is read and registered first.
+    size = _resolution_size(args.resolution, parser)
+    if size is not None and pipeline_type == "flux2":
+        from coreai_models.diffusion.components import register_flux2_resolution
+
+        try:
+            register_flux2_resolution(*size)
+        except ValueError as why:
+            parser.error(str(why))
+
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
 
@@ -203,8 +249,12 @@ def main() -> None:
     if args.platform == "iOS":
         multifunction = False
 
+    resolution: int | None = None
+    if size is None and args.resolution is not None:
+        resolution = int(str(args.resolution))
+
     # Warn of unused flags with multifunction.
-    if args.platform is None:
+    if args.platform is None and size is None:
         if args.resolution is not None:
             _warn(
                 "--resolution only applies with --platform; every component is exported without it."
@@ -213,7 +263,7 @@ def main() -> None:
             _warn(
                 "--low-memory only applies with --platform; every component is exported without it."
             )
-    elif multifunction:
+    elif multifunction and size is None:
         if args.resolution is not None:
             _warn(
                 f"--resolution {args.resolution} is not used without --single-function: one "
@@ -241,11 +291,30 @@ def main() -> None:
                 f"Invalid components for {pipeline_type}: {invalid}. Valid choices: {valid}.{hint}"
             )
 
+    if size is not None and pipeline_type == "flux2":
+        from coreai_models.diffusion.components import flux2_component_names
+
+        width, height = size
+        if multifunction:
+            parser.error(
+                f"--resolution {width}x{height} needs --single-function: the multi-function "
+                "asset carries the two square resolutions it was traced at and nothing else."
+            )
+        if not args.components:
+            names = flux2_component_names(width, height)
+            grid = args.reference_grid
+            args.components = [
+                names["transformer"],
+                names[f"transformer_img2img_{grid}"],
+                "text_encoder",
+                names["vae_decoder"],
+                names["vae_encoder"],
+            ]
+
     # Platform-based component selection (FLUX.2 only)
     target_components: list[str] | None = None
-    if args.platform and pipeline_type == "flux2":
+    if args.platform and pipeline_type == "flux2" and size is None:
         # Resolve effective resolution: --resolution overrides platform default
-        resolution = args.resolution
         if resolution is None:
             resolution = 512 if args.platform == "iOS" else 1024
 

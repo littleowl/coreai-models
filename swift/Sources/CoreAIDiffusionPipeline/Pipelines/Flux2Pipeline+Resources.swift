@@ -15,19 +15,38 @@ extension Flux2Pipeline {
     /// - `.full`: Transformer + VAEDecoder (1024×1024)
     /// - `.half`: Transformer_512 + VAEDecoder_half (512×512, 4× faster)
     /// - `.tiled`: Transformer + VAEDecoder_half (1024×1024 via tiled decode)
+    /// - Parameter size: A pixel size the bundle was exported at, like
+    ///   `(1024, 768)`. Its assets are named after it — `Transformer_1024x768`,
+    ///   `VAEDecoder_1024x768` — because the multi-function transformer carries
+    ///   only the two square entrypoints it was traced with, so every other
+    ///   resolution is its own set of assets. Nil picks the square ones by
+    ///   `mode`, or the bundle's only size when it holds exactly one.
     public init(
         from url: URL,
         config: PipelineDescriptor.ConfigSource = .auto,
-        mode: DecodeResolution = .auto
+        mode: DecodeResolution = .auto,
+        size: (width: Int, height: Int)? = nil
     ) async throws {
         let descriptor = try PipelineDescriptor.resolve(at: url, config: config)
 
+        // A bundle that holds one resolution-named set and no square assets
+        // needs no telling: it is what it is.
+        let wanted = size ?? Self.soleSize(at: url)
+
         // Resolve .auto → best available mode
         let resolvedMode: DecodeResolution
-        if mode == .auto {
+        if wanted != nil {
+            resolvedMode = .full
+        } else if mode == .auto {
             resolvedMode = try Self.bestAvailableMode(at: url, descriptor: descriptor)
         } else {
             resolvedMode = mode
+        }
+
+        if let wanted {
+            try await self.init(
+                from: url, descriptor: descriptor, size: wanted, tokenizerAt: url)
+            return
         }
 
         guard let textEncoderPath = descriptor.components.textEncoder else {
@@ -145,18 +164,103 @@ extension Flux2Pipeline {
         let bnVar = Flux2Pipeline.loadNpyFloat32(url.appendingPathComponent("vae_bn_var.npy"))
         let bnEps = descriptor.batchNormEps ?? 1e-5
 
-        self.descriptor = descriptor
-        self.mode = resolvedMode
-        self.transformer = transformer
-        self.img2imgRoutes = img2imgRoutes
-        self.textEncoder = textEncoder
-        self.decoder = decoder
-        self.encoder = encoder
-        self.transformerFunctionName = transformerFnName
-        self.tokenizer = tokenizer
-        self.batchNormMean = bnMean
-        self.batchNormVar = bnVar
-        self.batchNormEps = bnEps
+        // Delegating rather than assigning, because the resolution-named path
+        // above delegates and an initializer cannot do both.
+        self.init(
+            descriptor: descriptor,
+            mode: resolvedMode,
+            transformer: transformer,
+            img2imgRoutes: img2imgRoutes,
+            textEncoder: textEncoder,
+            decoder: decoder,
+            encoder: encoder,
+            transformerFunctionName: transformerFnName,
+            tokenizer: tokenizer,
+            batchNormMean: bnMean,
+            batchNormVar: bnVar,
+            batchNormEps: bnEps)
+    }
+
+    /// A bundle exported at one resolution, whose assets carry it in their
+    /// names.
+    ///
+    /// Everything is explicit: the transformer, both VAEs and each img2img
+    /// grid are their own assets, entered through `main`, so there is no mode
+    /// to resolve and no entrypoint to guess.
+    private init(
+        from url: URL,
+        descriptor: PipelineDescriptor,
+        size: (width: Int, height: Int),
+        tokenizerAt tokenizerRoot: URL
+    ) async throws {
+        let suffix = "\(size.width)x\(size.height)"
+        guard let transformerPath = Self.resolveAsset(at: url, name: "Transformer_\(suffix)") else {
+            throw PipelineLoadError.missingComponent("Transformer_\(suffix)")
+        }
+        guard let decoderPath = Self.resolveAsset(at: url, name: "VAEDecoder_\(suffix)") else {
+            throw PipelineLoadError.missingComponent("VAEDecoder_\(suffix)")
+        }
+        guard let textEncoderPath = descriptor.components.textEncoder else {
+            throw PipelineLoadError.missingComponent("text_encoder")
+        }
+
+        var routes: [ReferenceGrid: Img2ImgRoute] = [:]
+        for grid in ReferenceGrid.allCases {
+            if let path = Self.resolveAsset(
+                at: url, name: "Transformer_\(suffix)_img2img_\(grid.rawValue)")
+            {
+                routes[grid] = Img2ImgRoute(
+                    function: CoreAIDiffusionModelFunction(
+                        modelURL: url.appendingPathComponent(path)),
+                    entrypoint: "main")
+            }
+        }
+
+        let encoderPath = Self.resolveAsset(at: url, name: "VAEEncoder_\(suffix)")
+        let tokenizer = try await AutoTokenizer.from(
+            modelFolder: tokenizerRoot.appendingPathComponent("tokenizer"))
+
+        self.init(
+            descriptor: descriptor,
+            mode: .full,
+            transformer: CoreAIDiffusionModelFunction(
+                modelURL: url.appendingPathComponent(transformerPath)),
+            img2imgRoutes: routes,
+            textEncoder: CoreAIDiffusionModelFunction(
+                modelURL: url.appendingPathComponent(textEncoderPath)),
+            decoder: CoreAIDiffusionModelFunction(
+                modelURL: url.appendingPathComponent(decoderPath)),
+            encoder: encoderPath.map {
+                CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent($0))
+            },
+            transformerFunctionName: "main",
+            tokenizer: tokenizer,
+            batchNormMean: Flux2Pipeline.loadNpyFloat32(
+                url.appendingPathComponent("vae_bn_mean.npy")),
+            batchNormVar: Flux2Pipeline.loadNpyFloat32(
+                url.appendingPathComponent("vae_bn_var.npy")),
+            batchNormEps: descriptor.batchNormEps ?? 1e-5,
+            pixelSize: size)
+    }
+
+    /// The one resolution a bundle was exported at, when it holds exactly one
+    /// and no square assets to be ambiguous with.
+    static func soleSize(at url: URL) -> (width: Int, height: Int)? {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        var sizes = Set<[Int]>()
+        for name in names {
+            // `Transformer_1024x768.aimodel`, but not
+            // `Transformer_1024x768_img2img_half.aimodel`, which is the same size.
+            guard name.hasPrefix("Transformer_"), name.hasSuffix(".aimodel") else { continue }
+            let middle = name.dropFirst("Transformer_".count).dropLast(".aimodel".count)
+            let parts = middle.split(separator: "x")
+            guard parts.count == 2, let width = Int(parts[0]), let height = Int(parts[1]) else {
+                continue
+            }
+            sizes.insert([width, height])
+        }
+        guard sizes.count == 1, let only = sizes.first else { return nil }
+        return (width: only[0], height: only[1])
     }
 
     /// Resolve an asset name to a filename, checking for .aimodel or .aimodelc.

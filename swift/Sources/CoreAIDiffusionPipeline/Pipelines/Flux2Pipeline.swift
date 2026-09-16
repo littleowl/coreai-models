@@ -30,6 +30,13 @@ public struct Img2ImgRoute: Sendable {
 public struct Flux2Pipeline: DiffusionPipeline {
     public let descriptor: PipelineDescriptor
     public let mode: DecodeResolution
+    /// The pixel size this bundle's assets were traced at, when they say so.
+    ///
+    /// Non-square resolutions are their own assets, named after themselves,
+    /// because the multi-function transformer holds only the two square
+    /// entrypoints it was traced with. Nil for those two, where the mode
+    /// decides.
+    public let pixelSize: (width: Int, height: Int)?
 
     public let transformer: CoreAIDiffusionModelFunction
     /// How each reference grid reaches a traced graph, resolved at load time.
@@ -104,7 +111,12 @@ public struct Flux2Pipeline: DiffusionPipeline {
     }
 
     /// Image size is determined by the mode selected at init.
+    ///
+    /// A resolution-named export (`Transformer_1024x768`) says its own size, and
+    /// `pixelSize` carries it; the square exports fall back to the mode, which
+    /// is what they always did.
     public var defaultImageSize: (width: Int, height: Int) {
+        if let pixelSize { return pixelSize }
         let full = descriptor.imageSize ?? 1024
         let size = (mode == .half) ? full / 2 : full
         return (size, size)
@@ -130,7 +142,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
         tokenizer: any Tokenizer,
         batchNormMean: [Float]?,
         batchNormVar: [Float]?,
-        batchNormEps: Float
+        batchNormEps: Float,
+        pixelSize: (width: Int, height: Int)? = nil
     ) {
         self.descriptor = descriptor
         self.mode = mode
@@ -144,6 +157,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         self.batchNormMean = batchNormMean
         self.batchNormVar = batchNormVar
         self.batchNormEps = batchNormEps
+        self.pixelSize = pixelSize
 
         if tokenizer.convertTokenToId("<|endoftext|>") == nil {
             CLILogger.log(
@@ -190,11 +204,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
         if configuration.lazyModelLoading { await textEncoder.unloadResources() }
         let textSeqLen = textEmbeddings.count / hiddenDim(textEmbeddings)
 
-        // 2. Determine latent dimensions from image size
-        let imageSize = defaultImageSize.width
-        let spatialSide = imageSize / Self.patchSize
+        // 2. Determine latent dimensions from image size.
+        //
+        // The grid is two numbers, not one: an iPad is not square and neither
+        // is a coloring page. Everything below counts tokens as gridW * gridH.
+        let (imageWidth, imageHeight) = defaultImageSize
+        let gridW = imageWidth / Self.patchSize
+        let gridH = imageHeight / Self.patchSize
         let inChannels = Self.latentChannels
-        let seqLen = spatialSide * spatialSide
+        let seqLen = gridW * gridH
 
         // 3. Setup scheduler.
         // Reference-token img2img uses the full schedule (1.0 → 0): structure comes
@@ -221,40 +239,46 @@ public struct Flux2Pipeline: DiffusionPipeline {
             sigmaMax: sigmaMax
         )
 
-        // 4. Generate noise [1, inChannels, spatialSide, spatialSide]
-        let latentShape = [1, inChannels, spatialSide, spatialSide]
+        // 4. Generate noise [1, inChannels, gridH, gridW]
+        let latentShape = [1, inChannels, gridH, gridW]
         let latentCount = latentShape.reduce(1, *)
         let noise = generateNoise(count: latentCount, seed: configuration.seed)
         let noisePacked = packLatentsSpatialFlatten(
-            noise, channels: inChannels, height: spatialSide, width: spatialSide)
+            noise, channels: inChannels, height: gridH, width: gridW)
 
         // 5. Initialize packed latents and reference tokens
         var packedLatents: [Float]
         var referenceTokens: [Float]?
-        var refSide: Int = 0
+        var refW = 0
+        var refH = 0
 
         if isActuallyImg2Img,
             let enc = encoder,
             let srcImage = configuration.startingImage
         {
-            // Reference grid size based on the requested reference grid
+            // The reference grid is the noise grid divided on both sides, so a
+            // 4:3 reference of a 4:3 page stays 4:3.
+            let divisor: Int
             switch configuration.referenceGrid {
-            case .full: refSide = spatialSide  // 64×64 = 4096 tokens
-            case .half: refSide = spatialSide / 2  // 32×32 = 1024 tokens
-            case .quarter: refSide = spatialSide / 4  // 16×16 = 256 tokens
+            case .full: divisor = 1
+            case .half: divisor = 2
+            case .quarter: divisor = 4
             }
+            refW = max(1, gridW / divisor)
+            refH = max(1, gridH / divisor)
 
             // Encode reference at full resolution, then subsample tokens if needed
             let fullRefPacked = try await encodeReferenceImage(
-                encoder: enc, srcImage: srcImage, imageSize: imageSize,
-                spatialSide: spatialSide, inChannels: inChannels
+                encoder: enc, srcImage: srcImage, imageWidth: imageWidth, imageHeight: imageHeight,
+                gridW: gridW, gridH: gridH, inChannels: inChannels
             )
             let refPacked: [Float]
-            if refSide == spatialSide {
+            if refW == gridW && refH == gridH {
                 refPacked = fullRefPacked
             } else {
                 refPacked = Self.subsampleTokens(
-                    fullRefPacked, fromSide: spatialSide, toSide: refSide, channels: inChannels)
+                    fullRefPacked, fromW: gridW, fromH: gridH, toW: refW, toH: refH,
+                    channels: inChannels)
             }
             referenceTokens = refPacked
             if configuration.lazyModelLoading { await enc.unloadResources() }
@@ -276,15 +300,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
             throw PipelineLoadError.missingConfig(
                 "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
         }
-        let refSeqLen = refSide * refSide
+        let refSeqLen = refW * refH
         // img2img appends reference tokens after the noise tokens, marked T=10 on axis 0
         // so the transformer's in-graph RoPE separates them from the noise grid.
         let imageIds: [Float]
         if referenceTokens != nil {
             imageIds = buildImageIdsWithReference(
-                noiseSide: spatialSide, refSide: refSide, axisCount: axisCount)
+                noiseW: gridW, noiseH: gridH, refW: refW, refH: refH, axisCount: axisCount)
         } else {
-            imageIds = buildImageIds(side: spatialSide, axisCount: axisCount)
+            imageIds = buildImageIds(gridW: gridW, gridH: gridH, axisCount: axisCount)
         }
         let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
@@ -427,15 +451,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
                 // Unpack → denorm → unpatchify: [1, 128, 64, 64] → [1, 32, 128, 128]
                 // These are array copies, no model call.
                 let spatial = unpackLatentsSpatialFlatten(
-                    packedLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+                    packedLatents, channels: inChannels, height: gridH, width: gridW)
                 let denormed = applyBatchNormDenorm(
-                    spatial, channels: inChannels, height: spatialSide, width: spatialSide)
+                    spatial, channels: inChannels, height: gridH, width: gridW)
                 let unpatchified = Self.unpatchifyLatents(
-                    denormed, channels: inChannels, height: spatialSide, width: spatialSide)
+                    denormed, channels: inChannels, height: gridH, width: gridW)
 
                 let vaeChannels = inChannels / 4  // 128 → 32 after patchify
-                let vaeHeight = spatialSide * 2
-                let vaeWidth = spatialSide * 2
+                let vaeHeight = gridH * 2
+                let vaeWidth = gridW * 2
                 var previewLatents = NDArray(
                     shape: [1, vaeChannels, vaeHeight, vaeWidth], scalarType: .float32)
                 previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
@@ -453,19 +477,19 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
         // 8. Unpack: (B, H*W, C) → (B, C, H, W)
         var spatialLatents = unpackLatentsSpatialFlatten(
-            packedLatents, channels: inChannels, height: spatialSide, width: spatialSide
+            packedLatents, channels: inChannels, height: gridH, width: gridW
         )
 
         // 9. Batch norm denormalization
         spatialLatents = applyBatchNormDenorm(
-            spatialLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+            spatialLatents, channels: inChannels, height: gridH, width: gridW)
 
-        // 10. Unpatchify: (B, 128, 64, 64) → (B, 32, 128, 128)
+        // 10. Unpatchify: (B, 128, gridH, gridW) → (B, 32, gridH*2, gridW*2)
         let vaeChannels = inChannels / 4
-        let vaeHeight = spatialSide * 2
-        let vaeWidth = spatialSide * 2
+        let vaeHeight = gridH * 2
+        let vaeWidth = gridW * 2
         let unpatchified = Self.unpatchifyLatents(
-            spatialLatents, channels: inChannels, height: spatialSide, width: spatialSide)
+            spatialLatents, channels: inChannels, height: gridH, width: gridW)
 
         // 11. VAE decode
         // Note: self.decoder is mode-appropriate (loaded at init):
@@ -478,15 +502,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
         switch mode {
         case .full, .half:
             pixels = try await decoder.run(floatInputs: [(unpatchified, vaeShape)])
-            outputHeight = imageSize
-            outputWidth = imageSize
+            outputHeight = imageHeight
+            outputWidth = imageWidth
 
         case .tiled:
             pixels = try await decodeTiled(
                 latents: unpatchified, channels: vaeChannels, height: vaeHeight, width: vaeWidth,
                 decoder: decoder, outputScale: 8)
-            outputHeight = imageSize
-            outputWidth = imageSize
+            outputHeight = imageHeight
+            outputWidth = imageWidth
 
         case .auto:
             preconditionFailure("auto resolved at init")
@@ -512,23 +536,26 @@ public struct Flux2Pipeline: DiffusionPipeline {
     private func encodeReferenceImage(
         encoder: CoreAIDiffusionModelFunction,
         srcImage: CGImage,
-        imageSize: Int,
-        spatialSide: Int,
+        imageWidth: Int,
+        imageHeight: Int,
+        gridW: Int,
+        gridH: Int,
         inChannels: Int
     ) async throws -> [Float] {
-        let resized = CGImageUtils.resize(srcImage, to: imageSize) ?? srcImage
+        let resized = CGImageUtils.resize(srcImage, width: imageWidth, height: imageHeight) ?? srcImage
         let encoderScaleFactor = descriptor.encoderScaleFactor ?? 0.18215
 
         let imagePixels = try CGImageUtils.toNormalizedPlanarRGB(resized)
-        let encodedFloats = try await encoder.run(floatInputs: [(imagePixels, [1, 3, imageSize, imageSize])])
+        let encodedFloats = try await encoder.run(
+            floatInputs: [(imagePixels, [1, 3, imageHeight, imageWidth])])
 
         let scaledEncoded = encodedFloats.map { $0 * encoderScaleFactor }
         let patchified = Self.patchifyLatents(
-            scaledEncoded, inChannels: inChannels, height: spatialSide, width: spatialSide)
+            scaledEncoded, inChannels: inChannels, height: gridH, width: gridW)
         let normalized = applyBatchNormNorm(
-            patchified, channels: inChannels, height: spatialSide, width: spatialSide)
+            patchified, channels: inChannels, height: gridH, width: gridW)
         return packLatentsSpatialFlatten(
-            normalized, channels: inChannels, height: spatialSide, width: spatialSide)
+            normalized, channels: inChannels, height: gridH, width: gridW)
     }
 
     // MARK: - Text Encoding
@@ -599,13 +626,13 @@ public struct Flux2Pipeline: DiffusionPipeline {
 
     // MARK: - RoPE Position IDs
 
-    /// `img_ids` for in-graph RoPE: `[1, side*side, axisCount]` flattened row-major,
-    /// one row per image token as [T, H, W, L].
-    private func buildImageIds(side: Int, axisCount: Int) -> [Float] {
-        var ids = [Float](repeating: 0, count: side * side * axisCount)
-        for h in 0..<side {
-            for w in 0..<side {
-                let idx = h * side + w
+    /// `img_ids` for in-graph RoPE: `[1, gridH*gridW, axisCount]` flattened
+    /// row-major, one row per image token as [T, H, W, L].
+    private func buildImageIds(gridW: Int, gridH: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: gridW * gridH * axisCount)
+        for h in 0..<gridH {
+            for w in 0..<gridW {
+                let idx = h * gridW + w
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
             }
@@ -617,23 +644,23 @@ public struct Flux2Pipeline: DiffusionPipeline {
     /// Reference rows carry T=10 on axis 0 so in-graph RoPE keeps them positionally
     /// distinct from the noise grid even where H/W coincide.
     private func buildImageIdsWithReference(
-        noiseSide: Int, refSide: Int, axisCount: Int
+        noiseW: Int, noiseH: Int, refW: Int, refH: Int, axisCount: Int
     ) -> [Float] {
-        let noiseSeq = noiseSide * noiseSide
-        let refSeq = refSide * refSide
+        let noiseSeq = noiseW * noiseH
+        let refSeq = refW * refH
         var ids = [Float](repeating: 0, count: (noiseSeq + refSeq) * axisCount)
 
-        for h in 0..<noiseSide {
-            for w in 0..<noiseSide {
-                let idx = h * noiseSide + w
+        for h in 0..<noiseH {
+            for w in 0..<noiseW {
+                let idx = h * noiseW + w
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
             }
         }
 
-        for h in 0..<refSide {
-            for w in 0..<refSide {
-                let idx = noiseSeq + h * refSide + w
+        for h in 0..<refH {
+            for w in 0..<refW {
+                let idx = noiseSeq + h * refW + w
                 ids[idx * axisCount + 0] = Self.referenceTokenTimeOffset
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
@@ -660,20 +687,23 @@ public struct Flux2Pipeline: DiffusionPipeline {
     /// the rest away; the block mean retains all of it, so structure survives at the
     /// half/quarter grids. Channel index encodes intra-patch position, so averaging
     /// per channel keeps corresponding sub-positions aligned.
-    /// Input: [fromSide*fromSide, channels], Output: [toSide*toSide, channels]
+    /// Input: [fromH*fromW, channels], Output: [toH*toW, channels]. The two
+    /// strides are computed separately, so a non-square grid halves correctly
+    /// on both sides.
     static func subsampleTokens(
-        _ tokens: [Float], fromSide: Int, toSide: Int, channels: Int
+        _ tokens: [Float], fromW: Int, fromH: Int, toW: Int, toH: Int, channels: Int
     ) -> [Float] {
-        let stride = fromSide / toSide
-        let scale = 1.0 / Float(stride * stride)
-        var result = [Float](repeating: 0, count: toSide * toSide * channels)
-        for h in 0..<toSide {
-            for w in 0..<toSide {
-                let dstIdx = (h * toSide + w) * channels
-                for bh in 0..<stride {
-                    let srcRow = h * stride + bh
-                    for bw in 0..<stride {
-                        let srcIdx = (srcRow * fromSide + w * stride + bw) * channels
+        let strideW = max(1, fromW / toW)
+        let strideH = max(1, fromH / toH)
+        let scale = 1.0 / Float(strideW * strideH)
+        var result = [Float](repeating: 0, count: toW * toH * channels)
+        for h in 0..<toH {
+            for w in 0..<toW {
+                let dstIdx = (h * toW + w) * channels
+                for bh in 0..<strideH {
+                    let srcRow = h * strideH + bh
+                    for bw in 0..<strideW {
+                        let srcIdx = (srcRow * fromW + w * strideW + bw) * channels
                         for c in 0..<channels {
                             result[dstIdx + c] += tokens[srcIdx + c]
                         }

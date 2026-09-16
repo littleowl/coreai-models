@@ -35,8 +35,13 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_transformer_img2img_quarter,
     dummy_flux2_vae_decoder,
     dummy_flux2_vae_decoder_half,
+    dummy_flux2_transformer_at,
+    dummy_flux2_transformer_img2img_at,
+    dummy_flux2_vae_decoder_at,
+    dummy_flux2_vae_encoder_at,
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
+    grid_for,
 )
 from coreai_models.diffusion.wan import (
     WanTextEncoderWrapper,
@@ -491,6 +496,93 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
 }
 
 ALL_FLUX2_COMPONENTS: list[str] = list(FLUX2_COMPONENTS.keys())
+
+
+# ---------------------------------------------------------------------------
+# Components at any resolution
+# ---------------------------------------------------------------------------
+
+REFERENCE_GRIDS = ("full", "half", "quarter")
+
+
+def flux2_component_names(width: int, height: int) -> dict[str, str]:
+    """What the components for one pixel size are called.
+
+    A resolution's assets carry it in their names — `Transformer_1024x768`,
+    `VAEDecoder_1024x768` — so a bundle can hold several and the pipeline can
+    pick one by name. The square 512 and 1024 exports keep the names they
+    always had, so nothing that reads an existing bundle changes.
+    """
+    size = f"{width}x{height}"
+    names = {
+        "transformer": f"transformer_{size}",
+        "vae_decoder": f"vae_decoder_{size}",
+        "vae_encoder": f"vae_encoder_{size}",
+    }
+    for grid in REFERENCE_GRIDS:
+        names[f"transformer_img2img_{grid}"] = f"transformer_{size}_img2img_{grid}"
+    return names
+
+
+def register_flux2_resolution(width: int, height: int) -> list[str]:
+    """Adds one pixel size's components to the registry; returns their keys.
+
+    Every entry is the same architecture traced at a different sequence
+    length, so this costs nothing until something asks for one.
+    """
+    grid_for(width, height)  # refuses a size the model cannot patch
+    size = f"{width}x{height}"
+    keys: list[str] = []
+
+    transformer_key = f"transformer_{size}"
+    if transformer_key not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS[transformer_key] = ComponentSpec(
+            asset_name=f"Transformer_{size}",
+            input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+            output_names=("output",),
+            wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+            dummy_fn=dummy_flux2_transformer_at(width, height),
+            quantizable=True,
+        )
+    keys.append(transformer_key)
+
+    for grid in REFERENCE_GRIDS:
+        key = f"transformer_{size}_img2img_{grid}"
+        if key not in FLUX2_COMPONENTS:
+            FLUX2_COMPONENTS[key] = ComponentSpec(
+                asset_name=f"Transformer_{size}_img2img_{grid}",
+                input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+                output_names=("output",),
+                wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+                dummy_fn=dummy_flux2_transformer_img2img_at(width, height, grid),
+                quantizable=True,
+            )
+        keys.append(key)
+
+    decoder_key = f"vae_decoder_{size}"
+    if decoder_key not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS[decoder_key] = ComponentSpec(
+            asset_name=f"VAEDecoder_{size}",
+            input_names=("z",),
+            output_names=("image",),
+            wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae),
+            dummy_fn=dummy_flux2_vae_decoder_at(width, height),
+        )
+    keys.append(decoder_key)
+
+    encoder_key = f"vae_encoder_{size}"
+    if encoder_key not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS[encoder_key] = ComponentSpec(
+            asset_name=f"VAEEncoder_{size}",
+            input_names=("image",),
+            output_names=("latent_params",),
+            wrapper_fn=lambda p: Flux2VAEEncoderWrapper(p.vae),
+            dummy_fn=dummy_flux2_vae_encoder_at(width, height),
+        )
+    keys.append(encoder_key)
+
+    ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
+    return keys
 
 
 # Multi-function transformer: 8 functions in one .aimodel, shared weights (~2 GB)

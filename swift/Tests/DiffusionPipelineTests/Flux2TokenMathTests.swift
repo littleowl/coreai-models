@@ -24,7 +24,7 @@ struct Flux2TokenMathTests {
     func subsampleStrideOneIsIdentity() {
         let tokens = ramp(8 * 8 * 4)
         let actual = Flux2Pipeline.subsampleTokens(
-            tokens, fromSide: 8, toSide: 8, channels: 4)
+            tokens, fromW: 8, fromH: 8, toW: 8, toH: 8, channels: 4)
         #expect(actual == tokens)
     }
 
@@ -39,7 +39,7 @@ struct Flux2TokenMathTests {
             for c in 0..<channels { tokens[token * channels + c] = Float(c) * 10 }
         }
         let actual = Flux2Pipeline.subsampleTokens(
-            tokens, fromSide: fromSide, toSide: 2, channels: channels)
+            tokens, fromW: fromSide, fromH: fromSide, toW: 2, toH: 2, channels: channels)
         for token in 0..<4 {
             for c in 0..<channels {
                 #expect(abs(actual[token * channels + c] - Float(c) * 10) < 1e-5)
@@ -55,10 +55,28 @@ struct Flux2TokenMathTests {
         // grid holds {r, r+1, r+4, r+5}, so its mean is r + 2.5.
         let tokens = (0..<16).map { Float($0) }
         let actual = Flux2Pipeline.subsampleTokens(
-            tokens, fromSide: 4, toSide: 2, channels: 1)
+            tokens, fromW: 4, fromH: 4, toW: 2, toH: 2, channels: 1)
         #expect(actual.count == 4)
         for (i, origin) in [0, 2, 8, 10].enumerated() {
             #expect(abs(actual[i] - (Float(origin) + 2.5)) < 1e-5, "block \(i)")
+        }
+    }
+
+    /// The reason all of this became two numbers: a 4:3 grid has to halve to a
+    /// 4:3 grid, not to a square one.
+    @Test("subsampleTokens halves a non-square grid on both sides")
+    func subsampleKeepsTheShape() {
+        // 8 wide, 6 tall, one channel, value = token index.
+        let tokens = (0..<48).map { Float($0) }
+        let actual = Flux2Pipeline.subsampleTokens(
+            tokens, fromW: 8, fromH: 6, toW: 4, toH: 3, channels: 1)
+        #expect(actual.count == 12)
+        // Each 2x2 block of an 8-wide grid holds {r, r+1, r+8, r+9}: mean r + 4.5.
+        for row in 0..<3 {
+            for col in 0..<4 {
+                let origin = row * 16 + col * 2
+                #expect(abs(actual[row * 4 + col] - (Float(origin) + 4.5)) < 1e-5)
+            }
         }
     }
 
