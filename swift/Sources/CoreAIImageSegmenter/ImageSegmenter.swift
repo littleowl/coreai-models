@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAI
 import CoreAIShared
 import CoreGraphics
 import Foundation
@@ -160,7 +161,10 @@ public struct ImageSegmenter {
     /// let runner = try await ImageSegmenter(resourcesAt: "~/models/my-model")
     /// let segments = try await runner.segment(image: cgImage, prompt: "cat")
     /// ```
-    public init(resourcesAt path: String, parameters: SegmentationParameters = .default)
+    /// Pass `options` to choose the processor the model is specialized for; `nil` lets the
+    /// asset's structure choose, which is the behaviour of every earlier release.
+    public init(resourcesAt path: String, parameters: SegmentationParameters = .default,
+                options: SpecializationOptions? = nil)
         async throws
     {
         let bundle = try ModelBundle(from: path)
@@ -170,7 +174,8 @@ public struct ImageSegmenter {
         let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let tokenizerFolder = bundle.bundlePath.appending(path: "tokenizer")
 
-        let engine = try await CoreAISegmentationEngine(parameters: parameters, modelURL: modelURL)
+        let engine = try await CoreAISegmentationEngine(parameters: parameters, modelURL: modelURL,
+                                                       options: options)
         try self.init(engine: engine, tokenizerFolder: tokenizerFolder)
     }
 }

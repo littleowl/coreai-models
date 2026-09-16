@@ -41,8 +41,15 @@ public struct CoreAISegmentationEngine {
 
     // MARK: - Init
 
-    public init(parameters: SegmentationParameters, modelURL: URL) async throws {
-        let preparedAsset = try await PreparedModel.prepare(at: modelURL)
+    /// - Parameters:
+    ///   - parameters: Decoding parameters the engine keeps for its own preprocessing.
+    ///   - modelURL: The `.aimodel` asset to load.
+    ///   - options: Specialization options to load with, or `nil` to let the asset's
+    ///     structure choose (`image_encode`/`text_encode`/`detect` → Neural Engine, a single
+    ///     `main` graph → GPU). Pass one to put a model on a different processor.
+    public init(parameters: SegmentationParameters, modelURL: URL,
+                options: SpecializationOptions? = nil) async throws {
+        let preparedAsset = try await PreparedModel.prepare(at: modelURL, options: options)
         let model = preparedAsset.model
 
         // `PreparedModel` already classified the asset (and used that classification to pick

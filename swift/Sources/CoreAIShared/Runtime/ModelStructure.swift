@@ -187,13 +187,19 @@ public struct PreparedModel: Sendable {
     ///
     /// Specialization options are derived automatically from the detected model structure:
     /// dynamic models prefer GPU with frequent reshapes; chunked-static models prefer Neural Engine.
+    /// Pass `options` to override that choice — the structure-derived default is right for most
+    /// assets, but a caller that has measured its model on this device may know better, and a
+    /// device whose Neural Engine refuses a given program needs a way off it.
     ///
     /// - Parameters:
     ///   - url: URL to the model asset (`.aimodel` or `.aimodelc` bundle)
+    ///   - options: Specialization options to load with, or `nil` to derive them from the
+    ///     detected structure.
     /// - Returns: Prepared asset with compiled library and detected structure
     /// - Throws: Error from `AIModel` if loading or specialization fails
     public static func prepare(
-        at url: URL
+        at url: URL,
+        options: SpecializationOptions? = nil
     ) async throws -> PreparedModel {
         CLILogger.log("PreparedModelAsset: Preparing \(url.lastPathComponent)")
 
@@ -201,7 +207,8 @@ public struct PreparedModel: Sendable {
         let probedStructure = probeStructure(at: url)
         CLILogger.log("  - Probed structure: \(probedStructure.description)")
 
-        let options = probedStructure.specializationOptions
+        let options = options ?? probedStructure.specializationOptions
+        CLILogger.log("  - Specializing for: \(options.preferredComputeUnitKind.map(String.init(describing:)) ?? "default")")
         let model = try await AIModel(contentsOf: url, options: options)
         CLILogger.log("  - Loaded \(model.functionNames.count) graphs")
 
