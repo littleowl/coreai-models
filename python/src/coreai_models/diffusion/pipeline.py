@@ -28,7 +28,11 @@ import torch
 from huggingface_hub import snapshot_download
 
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
-from coreai_models.diffusion.components import MultiFunctionComponentSpec, get_component_registry
+from coreai_models.diffusion.components import (
+    EnumeratedComponentSpec,
+    MultiFunctionComponentSpec,
+    get_component_registry,
+)
 from coreai_models.diffusion.gpu import export_multifunction, export_stateless
 from coreai_models.diffusion.models import get_pipeline_type
 from coreai_models.diffusion.presets import PRESETS, list_presets
@@ -120,6 +124,21 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
                 spec.input_names,
                 spec.output_names,
                 include_debug_info=config.include_debug_info,
+            )
+        elif isinstance(spec, EnumeratedComponentSpec):
+            static = spec.static_shapes_fn(hf_pipe) if spec.static_shapes_fn else None
+            logger.info(
+                f"Exporting {name} -> {spec.asset_name}.aimodel (one trace, "
+                f"{'shapes ' + str(list(static)) if static else 'token dimension left open'})"
+            )
+            program = export_stateless(
+                spec.wrapper_fn(hf_pipe),
+                spec.dummy_fn(hf_pipe),
+                spec.input_names,
+                spec.output_names,
+                dynamic_shapes=spec.dynamic_shapes_fn(),
+                include_debug_info=config.include_debug_info,
+                static_shapes=static,
             )
         else:
             logger.info(f"Exporting {name} -> {spec.asset_name}.aimodel")

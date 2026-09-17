@@ -11,6 +11,7 @@ for variable temporal dimensions.
 """
 
 import logging
+import sys
 
 import coreai_torch
 import torch
@@ -29,6 +30,24 @@ def _decomp_empty_permuted(size, physical_layout, **kwargs):
     return torch.empty([size[p] for p in physical_layout], **kwargs).permute(perm)
 
 
+def _decomp_split_with_sizes(size_list_owner, split_sizes, dim=0):
+    """Decompose split_with_sizes into slices.
+
+    ``coreai.split`` wants constant sizes, and a graph traced with a dimension
+    left open splits it with a symbolic one (FLUX.2 takes the text tokens back
+    off the front of the joint sequence). As slices, the first pieces have
+    constant bounds and the last runs to the end, so a text-then-image split
+    of an open sequence carries no symbolic bound at all.
+    """
+    pieces = []
+    start = 0
+    for index, size in enumerate(split_sizes):
+        end = sys.maxsize if index == len(split_sizes) - 1 else start + size
+        pieces.append(torch.ops.aten.slice.Tensor(size_list_owner, dim, start, end))
+        start = start + size
+    return pieces
+
+
 def export_stateless(
     wrapper: torch.nn.Module,
     dummy_inputs: tuple[torch.Tensor, ...],
@@ -36,6 +55,7 @@ def export_stateless(
     output_names: tuple[str, ...],
     dynamic_shapes: tuple[dict[int, torch.export.Dim] | None, ...] | None = None,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+    static_shapes: dict[str, dict[str, tuple[int, ...]]] | None = None,
 ) -> AIProgram:
     """Export a stateless model to a Core AI AIProgram.
 
@@ -49,6 +69,10 @@ def export_stateless(
         include_debug_info: When True, the converter runs in ``DEBUG`` mode and embeds debug
             information in the exported ``.aimodel``. Defaults to ``RELEASE`` mode,
             which embeds minimum debug information and makes the exported asset smaller.
+        static_shapes: Specialisations of a dynamic trace — label to (input name to
+            shape) — applied with ``set_static_shape_config`` before optimisation, so
+            a graph traced with an open dimension is compiled once per shape listed
+            and exposed as ``main_<label>``. None compiles the graph as traced.
 
     Returns:
         An optimized AIProgram ready for saving/compilation.
@@ -79,6 +103,10 @@ def export_stateless(
             exported = torch.export.export(module, args=dummy_inputs, dynamic_shapes=dynamic_shapes)
         coreai_decomp_table = coreai_torch.get_decomp_table()
         coreai_decomp_table[torch.ops.aten.empty_permuted.default] = _decomp_empty_permuted
+        if dynamic_shapes is not None:
+            # Only where a dimension is open: a static graph keeps its splits,
+            # so the exports measured so far are unchanged.
+            coreai_decomp_table[torch.ops.aten.split_with_sizes.default] = _decomp_split_with_sizes
         decomposed: torch.export.ExportedProgram = exported.run_decompositions(coreai_decomp_table)
         return decomposed
 
@@ -96,6 +124,9 @@ def export_stateless(
         output_names=output_names,
     )
     program = converter.to_coreai()
+    if static_shapes:
+        logger.info(f"Specialising 'main' for {len(static_shapes)} shapes: {list(static_shapes)}")
+        program.set_static_shape_config("main", static_shapes)
     program.optimize()
     return program
 

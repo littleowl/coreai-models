@@ -42,6 +42,9 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder_at,
     dummy_flux2_vae_encoder,
     dummy_flux2_vae_encoder_half,
+    flux2_token_counts,
+    flux2_transformer_dynamic_shapes,
+    flux2_transformer_static_shapes,
     grid_for,
 )
 from coreai_models.diffusion.wan import (
@@ -241,6 +244,29 @@ class MultiFunctionComponentSpec:
     quantizable: bool = True
 
 
+@dataclass(frozen=True)
+class EnumeratedComponentSpec:
+    """A component traced once with a dimension left open, then specialised
+    for a list of static shapes (`AIProgram.set_static_shape_config`).
+
+    The other way to get several shapes into one asset: where a
+    `MultiFunctionComponentSpec` traces the model once per shape and names
+    each trace, this traces it once and hands the compiler the shapes, which
+    it exposes as `main_<label>`. `static_shapes_fn` returns that table given
+    the pipeline; None leaves the dimension open in the asset, for a runtime
+    that can take it.
+    """
+
+    asset_name: str
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    wrapper_fn: Callable
+    dummy_fn: Callable
+    dynamic_shapes_fn: Callable
+    static_shapes_fn: Callable | None
+    quantizable: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Dummy-input factories — build reference tensors for torch.export
 # ---------------------------------------------------------------------------
@@ -337,7 +363,7 @@ SD_COMPONENTS: dict[str, ComponentSpec] = {
 
 ALL_SD_COMPONENTS: list[str] = list(SD_COMPONENTS.keys())
 
-FLUX2_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
+FLUX2_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec | EnumeratedComponentSpec] = {
     "transformer": ComponentSpec(
         asset_name="Transformer",
         input_names=(
@@ -647,6 +673,55 @@ def register_flux2_bundle(
             output_names=("output",),
             wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
             functions=tuple(functions),
+            quantizable=True,
+        )
+    ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
+    return [key] + keys
+
+
+def register_flux2_shapes(
+    sizes: Sequence[tuple[int, int]],
+    grids: Sequence[str] = ("half",),
+    references: int = 1,
+    enumerate_shapes: bool = True,
+) -> list[str]:
+    """One transformer for several sizes by enumerated shapes:
+    `Transformer_<w>x<h>+<w>x<h>_shapes`.
+
+    The same sizes, grids and reference count a bundle takes, but traced once
+    with the token dimension open and specialised per distinct token count
+    (`flux2_token_counts`) — so two orientations of one size are one shape,
+    and a size's image-to-image is one more. The runtime enters a shape as
+    `main_n<tokens>`. With `enumerate_shapes` false the dimension is left
+    open (`…_open`), for seeing whether the GPU runtime takes it as is.
+    Each size's VAEs are registered beside it; keys returned, transformer
+    first.
+    """
+    if not sizes:
+        raise ValueError("A shapes transformer needs at least one size.")
+    for grid in grids:
+        if grid not in REFERENCE_GRIDS:
+            raise ValueError(f"Unknown reference grid {grid!r}; one of {REFERENCE_GRIDS}.")
+    if references not in (1, 2):
+        raise ValueError("One or two reference images per function.")
+    keys: list[str] = []
+    for width, height in sizes:
+        keys += [k for k in register_flux2_resolution(width, height) if k.startswith("vae_")]
+
+    tag = flux2_bundle_tag(sizes) + ("+2ref" if references == 2 else "")
+    kind = "shapes" if enumerate_shapes else "open"
+    key = f"transformer_{kind}_{tag}"
+    if key not in FLUX2_COMPONENTS:
+        counts = flux2_token_counts(sizes, grids, references)
+        FLUX2_COMPONENTS[key] = EnumeratedComponentSpec(
+            asset_name=f"Transformer_{tag}_{kind}",
+            input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+            output_names=("output",),
+            wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+            # Traced at the smallest count; the shapes say the rest.
+            dummy_fn=dummy_flux2_transformer_at(*sizes[0]),
+            dynamic_shapes_fn=flux2_transformer_dynamic_shapes,
+            static_shapes_fn=flux2_transformer_static_shapes(counts) if enumerate_shapes else None,
             quantizable=True,
         )
     ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())

@@ -98,13 +98,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--shapes",
+        default=None,
+        help=(
+            "Sizes, comma-separated, like --bundle, but as one trace of the transformer with "
+            "the token dimension open, specialised per distinct token count with enumerated "
+            "shapes (main_n<tokens>) instead of traced once per function. Named "
+            "Transformer_<sizes joined by +>_shapes. Same companions as --bundle."
+        ),
+    )
+    parser.add_argument(
+        "--open-shape",
+        action="store_true",
+        help=(
+            "With --shapes: enumerate nothing and leave the token dimension open in the asset "
+            "(Transformer_…_open), to see whether the runtime takes a dynamic sequence as is."
+        ),
+    )
+    parser.add_argument(
         "--references",
         type=int,
         default=1,
         choices=[1, 2],
         help=(
             "With --bundle: 2 adds an img2img2_<size>_<grid> entrypoint per size that takes two "
-            "reference images, and names the bundle …+2ref. Default 1."
+            "reference images, and names the bundle …+2ref. With --shapes: 2 adds the "
+            "two-reference token count per size. Default 1."
         ),
     )
     parser.add_argument(
@@ -281,6 +300,32 @@ def main() -> None:
         args.single_function = True
         if not args.components:
             args.components = [bundle_keys[0], "text_encoder", *bundle_keys[1:]]
+
+    if args.shapes is not None and pipeline_type == "flux2":
+        if args.resolution is not None or args.bundle is not None:
+            parser.error("--shapes, --bundle and --resolution are three ways of naming sizes; use one.")
+        if args.platform:
+            parser.error("--shapes picks its own components; do not combine it with --platform.")
+        shaped: list[tuple[int, int]] = []
+        for part in str(args.shapes).split(","):
+            found = _resolution_size(part.strip(), parser)
+            if found is None:
+                parser.error(f"--shapes takes WxH sizes; {part!r} is a square preset.")
+            shaped.append(found)
+        from coreai_models.diffusion.components import register_flux2_shapes
+
+        try:
+            shape_keys = register_flux2_shapes(
+                shaped,
+                grids=(args.reference_grid,),
+                references=args.references,
+                enumerate_shapes=not args.open_shape,
+            )
+        except ValueError as why:
+            parser.error(str(why))
+        args.single_function = True
+        if not args.components:
+            args.components = [shape_keys[0], "text_encoder", *shape_keys[1:]]
 
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")

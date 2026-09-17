@@ -249,9 +249,42 @@ extension Flux2Pipeline {
                     twoReferenceRoutes[grid] = Img2ImgRoute(function: transformer, entrypoint: two)
                 }
             }
+        } else if let shapedPath = Self.shapesAsset(at: url, holding: suffix) {
+            // One trace specialised per token count (`--shapes` at export):
+            // `Transformer_768x576+576x768_shapes`, entered as `main_n<tokens>`.
+            // The transformer takes its positions as an input, so a size and
+            // its other orientation are the same function, and each reference
+            // picture is the same function at a longer count. An `_open`
+            // asset is the trace with the dimension still open, entered as
+            // `main` for every count.
+            let grid = (width: size.width / 16, height: size.height / 16)
+            let probe = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(shapedPath))
+            let names = try await probe.functionNames()
+            func entry(references: Int, of refGrid: ReferenceGrid?) -> String? {
+                var tokens = grid.width * grid.height
+                if let refGrid { tokens += Self.referenceTokens(refGrid, noise: grid) * references }
+                if names.contains("main_n\(tokens)") { return "main_n\(tokens)" }
+                return names == ["main"] ? "main" : nil
+            }
+            guard let text = entry(references: 0, of: nil) else {
+                throw PipelineLoadError.missingComponent(
+                    "\(shapedPath) has no shape for \(grid.width * grid.height) tokens; "
+                        + "it has \(names.joined(separator: ", "))")
+            }
+            transformerEntry = text
+            transformer = CoreAIDiffusionModelFunction(
+                modelURL: url.appendingPathComponent(shapedPath), entrypoint: text)
+            for refGrid in ReferenceGrid.allCases {
+                if let one = entry(references: 1, of: refGrid) {
+                    routes[refGrid] = Img2ImgRoute(function: transformer, entrypoint: one)
+                }
+                if let two = entry(references: 2, of: refGrid) {
+                    twoReferenceRoutes[refGrid] = Img2ImgRoute(function: transformer, entrypoint: two)
+                }
+            }
         } else {
             throw PipelineLoadError.missingComponent(
-                "Transformer_\(suffix), or a bundle holding \(suffix)")
+                "Transformer_\(suffix), or a bundle or shapes transformer holding \(suffix)")
         }
 
         let encoderPath = Self.resolveAsset(at: url, name: "VAEEncoder_\(suffix)")
@@ -284,6 +317,20 @@ extension Flux2Pipeline {
     /// A bundle transformer that holds this size: `Transformer_<a>+<b>+….aimodel`
     /// whose `+`-separated sizes include `suffix`. Nil when there is none.
     static func bundleAsset(at url: URL, holding suffix: String) -> String? {
+        multiSizeAsset(at: url, holding: suffix, kind: nil)
+    }
+
+    /// A shapes transformer that holds this size: `Transformer_<a>+<b>_shapes`
+    /// (specialised per token count) or `Transformer_<a>+<b>_open` (the token
+    /// dimension left open). Nil when there is none.
+    static func shapesAsset(at url: URL, holding suffix: String) -> String? {
+        multiSizeAsset(at: url, holding: suffix, kind: "shapes")
+            ?? multiSizeAsset(at: url, holding: suffix, kind: "open")
+    }
+
+    /// A transformer named after several sizes joined with `+`, with the
+    /// given `_kind` suffix (none for a bundle), whose sizes include `suffix`.
+    private static func multiSizeAsset(at url: URL, holding suffix: String, kind: String?) -> String? {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
         for name in names.sorted() {
             guard name.hasPrefix("Transformer_") else { continue }
@@ -292,9 +339,31 @@ extension Flux2Pipeline {
             else if middle.hasSuffix(".aimodel") { middle = middle.dropLast(".aimodel".count) }
             else { continue }
             guard middle.contains("+") else { continue }
-            if middle.split(separator: "+").contains(where: { $0 == suffix }) { return name }
+            // `768x576+576x768_shapes`: the kind rides after the last size.
+            var sizes = middle.split(separator: "+")
+            let last = sizes.removeLast()
+            let lastParts = last.split(separator: "_", maxSplits: 1)
+            let lastKind = lastParts.count == 2 ? String(lastParts[1]) : nil
+            guard lastKind == kind else { continue }
+            // An open trace runs at any token count, whatever sizes it was
+            // named after.
+            if kind == "open" { return name }
+            sizes.append(lastParts[0])
+            if sizes.contains(where: { $0 == suffix }) { return name }
         }
         return nil
+    }
+
+    /// How many tokens a reference picture adds at a grid, the way the run
+    /// computes it: each side of the noise grid divided, never below one.
+    static func referenceTokens(_ grid: ReferenceGrid, noise: (width: Int, height: Int)) -> Int {
+        let divisor: Int
+        switch grid {
+        case .full: divisor = 1
+        case .half: divisor = 2
+        case .quarter: divisor = 4
+        }
+        return max(1, noise.width / divisor) * max(1, noise.height / divisor)
     }
 
     /// The one resolution a bundle was exported at, when it holds exactly one

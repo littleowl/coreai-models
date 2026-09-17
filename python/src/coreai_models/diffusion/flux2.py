@@ -16,6 +16,7 @@ matching upstream diffusers. Position IDs are cheap to build and depend only on
 grid geometry, so the exported graph owns the frequency computation.
 """
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import torch
@@ -420,3 +421,77 @@ def dummy_flux2_transformer_img2img_512_half(pipe: Any) -> tuple[torch.Tensor, .
 def dummy_flux2_transformer_img2img_512_full(pipe: Any) -> tuple[torch.Tensor, ...]:
     """img2img full (512×512): 1024 noise + 1024 reference = 2048 img tokens."""
     return _dummy_flux2_transformer_img2img(pipe, noise_grid=32, ref_grid=32)
+
+
+# ---------------------------------------------------------------------------
+# One trace, several shapes
+# ---------------------------------------------------------------------------
+#
+# The transformer takes its positions as an input (`img_ids`), so nothing in
+# the graph knows a width from a height: a landscape and its portrait are the
+# same shape, and image-to-image is text-to-image with a longer token
+# sequence. So the shapes a transformer must serve are token counts, not
+# sizes — 768x576 and 576x768 are both 1728 tokens, and the half-grid
+# reference adds 432 — and one trace with the token dimension left open can
+# be specialised once per count (`set_static_shape_config`, the way the LLM
+# path builds its `extend_<ctx>_<len>` entrypoints) instead of traced once per
+# function. Whether Core AI then keeps one resident copy of the weights across
+# the specialisations, where a multi-function trace did not, is what
+# `--shapes` measures.
+
+TOKEN_DIM_NAME = "image_tokens"
+
+
+def flux2_transformer_dynamic_shapes() -> tuple[dict[int, "torch.export.Dim"] | None, ...]:
+    """The token dimension left open on the two inputs that carry it.
+
+    `hidden_states` is `[1, tokens, in_channels]` and `img_ids` is
+    `[1, tokens, axes]`; everything else — the text tokens, the timestep, the
+    guidance — is the same at every size. One `Dim` shared by both, so the
+    export knows they move together.
+    """
+    tokens = torch.export.Dim(TOKEN_DIM_NAME, min=16, max=16384)
+    return ({1: tokens}, None, None, None, {1: tokens}, None)
+
+
+def flux2_token_counts(
+    sizes: "Sequence[tuple[int, int]]", grids: "Sequence[str]" = ("half",), references: int = 1
+) -> list[int]:
+    """Every sequence length the functions over `sizes` run at, once each.
+
+    Text-to-image is the noise grid; image-to-image adds one reference grid
+    per reference. Sizes that are the same grid turned round collapse to one
+    count, which is the point.
+    """
+    counts: set[int] = set()
+    for width, height in sizes:
+        grid_w, grid_h = grid_for(width, height)
+        noise = grid_w * grid_h
+        counts.add(noise)
+        for grid in grids:
+            divisor = {"full": 1, "half": 2, "quarter": 4}[grid]
+            ref = max(1, grid_w // divisor) * max(1, grid_h // divisor)
+            for n in range(1, references + 1):
+                counts.add(noise + n * ref)
+    return sorted(counts)
+
+
+def shape_label(tokens: int) -> str:
+    """What a specialisation is called: `n1728`. Quoted, which is the form the
+    compiler wants for an attribute key; the runtime exposes it as
+    `main_n1728`."""
+    return f'"n{tokens}"'
+
+
+def flux2_transformer_static_shapes(token_counts: "Sequence[int]") -> Any:
+    """A `set_static_shape_config` table with one entry per token count."""
+
+    def shapes(pipe: Any) -> dict[str, dict[str, tuple[int, ...]]]:
+        cfg = pipe.transformer.config
+        axes = len(cfg.axes_dims_rope)
+        return {
+            shape_label(n): {"hidden_states": (1, n, cfg.in_channels), "img_ids": (1, n, axes)}
+            for n in token_counts
+        }
+
+    return shapes
