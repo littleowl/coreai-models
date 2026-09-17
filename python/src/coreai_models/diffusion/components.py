@@ -13,7 +13,7 @@ torch.nn.Module wrapper that normalises the HF output, and a factory for
 dummy inputs.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -336,7 +336,7 @@ SD_COMPONENTS: dict[str, ComponentSpec] = {
 
 ALL_SD_COMPONENTS: list[str] = list(SD_COMPONENTS.keys())
 
-FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
+FLUX2_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
     "transformer": ComponentSpec(
         asset_name="Transformer",
         input_names=(
@@ -583,6 +583,63 @@ def register_flux2_resolution(width: int, height: int) -> list[str]:
 
     ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
     return keys
+
+
+def flux2_bundle_tag(sizes: Sequence[tuple[int, int]]) -> str:
+    """The name a bundle of sizes goes by: `1152x864+864x1152`."""
+    return "+".join(f"{w}x{h}" for w, h in sizes)
+
+
+def register_flux2_bundle(
+    sizes: Sequence[tuple[int, int]], grids: Sequence[str] = ("half",)
+) -> list[str]:
+    """One transformer for several pixel sizes: `Transformer_<w>x<h>+<w>x<h>`.
+
+    A multi-function asset with a text-to-image entrypoint and one
+    image-to-image entrypoint per reference grid for every size, all sharing
+    one set of weights — so a landscape and its portrait, or a whole tier,
+    cost one download instead of ~2 GB per function per size. Each size's
+    VAEs are registered beside it (they are small and resolution-bound), and
+    the keys of everything a bundle needs are returned, transformer first.
+
+    Entrypoints are `txt2img_<w>x<h>` and `img2img_<w>x<h>_<grid>`. What a
+    bundle costs at run time — whether Core AI keeps one resident copy of the
+    weights across its entrypoints — is the measurement this exists for.
+    """
+    if not sizes:
+        raise ValueError("A bundle needs at least one size.")
+    keys: list[str] = []
+    for width, height in sizes:
+        keys += [k for k in register_flux2_resolution(width, height) if k.startswith("vae_")]
+    for grid in grids:
+        if grid not in REFERENCE_GRIDS:
+            raise ValueError(f"Unknown reference grid {grid!r}; one of {REFERENCE_GRIDS}.")
+
+    tag = flux2_bundle_tag(sizes)
+    key = f"transformer_bundle_{tag}"
+    if key not in FLUX2_COMPONENTS:
+        functions: list[FunctionVariant] = []
+        for width, height in sizes:
+            functions.append(
+                FunctionVariant(f"txt2img_{width}x{height}", dummy_flux2_transformer_at(width, height))
+            )
+            for grid in grids:
+                functions.append(
+                    FunctionVariant(
+                        f"img2img_{width}x{height}_{grid}",
+                        dummy_flux2_transformer_img2img_at(width, height, grid),
+                    )
+                )
+        FLUX2_COMPONENTS[key] = MultiFunctionComponentSpec(
+            asset_name=f"Transformer_{tag}",
+            input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+            output_names=("output",),
+            wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+            functions=tuple(functions),
+            quantizable=True,
+        )
+    ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
+    return [key] + keys
 
 
 # Multi-function transformer: 8 functions in one .aimodel, shared weights (~2 GB)

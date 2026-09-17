@@ -23,9 +23,15 @@ public actor CoreAIDiffusionModelFunction {
     /// than reloading per call) avoids a GPU memory leak — see PR #110.
     private var functionCache: [String: InferenceFunction] = [:]
     private var isLoaded = false
+    /// The function `loadResources` materialises: `main` for a single-function
+    /// asset, or the one entrypoint of a bundle this instance is for — a bundle
+    /// (`Transformer_768x576+576x768`) has no `main`, and loading every
+    /// entrypoint would be the memory this exists to avoid.
+    private let entrypoint: String
 
-    public init(modelURL: URL) {
+    public init(modelURL: URL, entrypoint: String = "main") {
         self.modelURL = modelURL
+        self.entrypoint = entrypoint
     }
 
     // MARK: - ResourceManaging
@@ -35,12 +41,12 @@ public actor CoreAIDiffusionModelFunction {
 
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let loadedModel = try await AIModel(contentsOf: modelURL, options: options)
-        guard let fn = try loadedModel.loadFunction(named: "main") else {
-            throw CoreAIDiffusionError.functionNotFound("main", modelURL)
+        guard let fn = try loadedModel.loadFunction(named: entrypoint) else {
+            throw CoreAIDiffusionError.functionNotFound(entrypoint, modelURL)
         }
 
         self.model = loadedModel
-        self.functionCache["main"] = fn
+        self.functionCache[entrypoint] = fn
         self.isLoaded = true
     }
 
@@ -57,10 +63,16 @@ public actor CoreAIDiffusionModelFunction {
     /// GPU-resident copy of the entire weight set and hold it for the lifetime of this actor.
     /// The asset is released once this function returns.
     public func hasFunction(named name: String) async throws -> Bool {
-        if let model { return model.functionNames.contains(name) }
+        try await functionNames().contains(name)
+    }
+
+    /// Every function the asset declares, read the same way — once, for a
+    /// caller that has several names to check against a bundle.
+    public func functionNames() async throws -> [String] {
+        if let model { return model.functionNames }
         let options = SpecializationOptions(preferredComputeUnitKind: .gpu)
         let probe = try await AIModel(contentsOf: modelURL, options: options)
-        return probe.functionNames.contains(name)
+        return probe.functionNames
     }
 
     // MARK: - [Float]-based API

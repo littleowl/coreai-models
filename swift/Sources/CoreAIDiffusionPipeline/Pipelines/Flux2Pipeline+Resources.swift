@@ -200,9 +200,6 @@ extension Flux2Pipeline {
         tokenizerAt tokenizerRoot: URL
     ) async throws {
         let suffix = "\(size.width)x\(size.height)"
-        guard let transformerPath = Self.resolveAsset(at: url, name: "Transformer_\(suffix)") else {
-            throw PipelineLoadError.missingComponent("Transformer_\(suffix)")
-        }
         guard let decoderPath = Self.resolveAsset(at: url, name: "VAEDecoder_\(suffix)") else {
             throw PipelineLoadError.missingComponent("VAEDecoder_\(suffix)")
         }
@@ -210,16 +207,46 @@ extension Flux2Pipeline {
             throw PipelineLoadError.missingComponent("text_encoder")
         }
 
+        // The size's transformer is its own asset, entered through `main`, or
+        // one entrypoint of a bundle — `Transformer_768x576+576x768.aimodel`,
+        // several sizes' functions over one set of weights (`--bundle` at
+        // export) — entered through `txt2img_<size>`, with its img2img grids
+        // as `img2img_<size>_<grid>` in the same asset.
+        let transformer: CoreAIDiffusionModelFunction
+        let transformerEntry: String
         var routes: [ReferenceGrid: Img2ImgRoute] = [:]
-        for grid in ReferenceGrid.allCases {
-            if let path = Self.resolveAsset(
-                at: url, name: "Transformer_\(suffix)_img2img_\(grid.rawValue)")
-            {
-                routes[grid] = Img2ImgRoute(
-                    function: CoreAIDiffusionModelFunction(
-                        modelURL: url.appendingPathComponent(path)),
-                    entrypoint: "main")
+        if let transformerPath = Self.resolveAsset(at: url, name: "Transformer_\(suffix)") {
+            transformer = CoreAIDiffusionModelFunction(
+                modelURL: url.appendingPathComponent(transformerPath))
+            transformerEntry = "main"
+            for grid in ReferenceGrid.allCases {
+                if let path = Self.resolveAsset(
+                    at: url, name: "Transformer_\(suffix)_img2img_\(grid.rawValue)")
+                {
+                    routes[grid] = Img2ImgRoute(
+                        function: CoreAIDiffusionModelFunction(
+                            modelURL: url.appendingPathComponent(path)),
+                        entrypoint: "main")
+                }
             }
+        } else if let bundlePath = Self.bundleAsset(at: url, holding: suffix) {
+            transformerEntry = "txt2img_\(suffix)"
+            transformer = CoreAIDiffusionModelFunction(
+                modelURL: url.appendingPathComponent(bundlePath), entrypoint: transformerEntry)
+            let names = try await transformer.functionNames()
+            guard names.contains(transformerEntry) else {
+                throw PipelineLoadError.missingComponent(
+                    "\(bundlePath) has no \(transformerEntry); it has \(names.joined(separator: ", "))")
+            }
+            for grid in ReferenceGrid.allCases {
+                let entry = "img2img_\(suffix)_\(grid.rawValue)"
+                if names.contains(entry) {
+                    routes[grid] = Img2ImgRoute(function: transformer, entrypoint: entry)
+                }
+            }
+        } else {
+            throw PipelineLoadError.missingComponent(
+                "Transformer_\(suffix), or a bundle holding \(suffix)")
         }
 
         let encoderPath = Self.resolveAsset(at: url, name: "VAEEncoder_\(suffix)")
@@ -229,8 +256,7 @@ extension Flux2Pipeline {
         self.init(
             descriptor: descriptor,
             mode: .full,
-            transformer: CoreAIDiffusionModelFunction(
-                modelURL: url.appendingPathComponent(transformerPath)),
+            transformer: transformer,
             img2imgRoutes: routes,
             textEncoder: CoreAIDiffusionModelFunction(
                 modelURL: url.appendingPathComponent(textEncoderPath)),
@@ -239,7 +265,7 @@ extension Flux2Pipeline {
             encoder: encoderPath.map {
                 CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent($0))
             },
-            transformerFunctionName: "main",
+            transformerFunctionName: transformerEntry,
             tokenizer: tokenizer,
             batchNormMean: Flux2Pipeline.loadNpyFloat32(
                 url.appendingPathComponent("vae_bn_mean.npy")),
@@ -247,6 +273,22 @@ extension Flux2Pipeline {
                 url.appendingPathComponent("vae_bn_var.npy")),
             batchNormEps: descriptor.batchNormEps ?? 1e-5,
             pixelSize: size)
+    }
+
+    /// A bundle transformer that holds this size: `Transformer_<a>+<b>+….aimodel`
+    /// whose `+`-separated sizes include `suffix`. Nil when there is none.
+    static func bundleAsset(at url: URL, holding suffix: String) -> String? {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        for name in names.sorted() {
+            guard name.hasPrefix("Transformer_") else { continue }
+            var middle = Substring(name.dropFirst("Transformer_".count))
+            if middle.hasSuffix(".aimodelc") { middle = middle.dropLast(".aimodelc".count) }
+            else if middle.hasSuffix(".aimodel") { middle = middle.dropLast(".aimodel".count) }
+            else { continue }
+            guard middle.contains("+") else { continue }
+            if middle.split(separator: "+").contains(where: { $0 == suffix }) { return name }
+        }
+        return nil
     }
 
     /// The one resolution a bundle was exported at, when it holds exactly one

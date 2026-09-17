@@ -88,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
         "asset. Overrides the platform default.",
     )
     parser.add_argument(
+        "--bundle",
+        default=None,
+        help=(
+            "Sizes, comma-separated (1152x864,864x1152): one multi-function transformer "
+            "holding text-to-image and image-to-image at every size, sharing weights, plus "
+            "each size's VAEs and the text encoder. Named Transformer_<sizes joined by +>. "
+            "The other components are exported as under --single-function."
+        ),
+    )
+    parser.add_argument(
         "--reference-grid",
         default="half",
         choices=["full", "half", "quarter"],
@@ -239,6 +249,28 @@ def main() -> None:
             register_flux2_resolution(*size)
         except ValueError as why:
             parser.error(str(why))
+
+    bundle: list[tuple[int, int]] | None = None
+    if args.bundle is not None and pipeline_type == "flux2":
+        if args.resolution is not None:
+            parser.error("--bundle and --resolution are two ways of naming sizes; use one.")
+        if args.platform:
+            parser.error("--bundle picks its own components; do not combine it with --platform.")
+        bundle = []
+        for part in str(args.bundle).split(","):
+            found = _resolution_size(part.strip(), parser)
+            if found is None:
+                parser.error(f"--bundle takes WxH sizes; {part!r} is a square preset.")
+            bundle.append(found)
+        from coreai_models.diffusion.components import register_flux2_bundle
+
+        try:
+            bundle_keys = register_flux2_bundle(bundle, grids=(args.reference_grid,))
+        except ValueError as why:
+            parser.error(str(why))
+        args.single_function = True
+        if not args.components:
+            args.components = [bundle_keys[0], "text_encoder", *bundle_keys[1:]]
 
     if args.components and args.platform:
         parser.error("Cannot specify both --components and --platform. Use only one.")
