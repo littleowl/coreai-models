@@ -312,12 +312,44 @@ def dummy_flux2_transformer_512(pipe: Any) -> tuple[torch.Tensor, ...]:
 # ---------------------------------------------------------------------------
 
 
+# A second reference image's tokens carry T=20: distinct from the noise grid
+# (T=0) and from the first reference (T=10) where H/W coincide. Mirrors
+# Flux2Pipeline.secondReferenceTokenTimeOffset on the Swift side.
+SECOND_REFERENCE_TOKEN_TIME_OFFSET = 20.0
+
+
+def dummy_flux2_transformer_img2img2_at(width: int, height: int, grid: str) -> Any:
+    """A two-reference transformer dummy: noise tokens plus two reference grids.
+
+    Both references are the same grid (`full`, `half`, `quarter` of the noise
+    grid), concatenated after the noise tokens in turn, each with its own time
+    offset so RoPE keeps the three grids apart. The sequence is one reference
+    longer than image-to-image's, which is the memory this variant measures.
+    """
+    divisor = {"full": 1, "half": 2, "quarter": 4}[grid]
+    grid_w, grid_h = grid_for(width, height)
+    ref_w, ref_h = max(1, grid_w // divisor), max(1, grid_h // divisor)
+
+    def dummy(pipe: Any) -> tuple[torch.Tensor, ...]:
+        return _dummy_flux2_transformer_img2img(
+            pipe, noise_grid=grid_w, ref_grid=ref_w, noise_grid_h=grid_h, ref_grid_h=ref_h,
+            references=2,
+        )
+
+    dummy.__doc__ = (
+        f"img2img, two references, {grid} ({width}x{height}): {grid_w * grid_h} noise + "
+        f"2 × {ref_w * ref_h} reference tokens."
+    )
+    return dummy
+
+
 def _dummy_flux2_transformer_img2img(
     pipe: Any,
     noise_grid: int,
     ref_grid: int,
     noise_grid_h: int | None = None,
     ref_grid_h: int | None = None,
+    references: int = 1,
 ) -> tuple[torch.Tensor, ...]:
     """Build dummy inputs for img2img transformer with concatenated reference tokens.
 
@@ -336,19 +368,18 @@ def _dummy_flux2_transformer_img2img(
     ref_grid_h = ref_grid if ref_grid_h is None else ref_grid_h
     noise_seq = noise_grid * noise_grid_h
     ref_seq = ref_grid * ref_grid_h
-    total_img_seq = noise_seq + ref_seq
+    total_img_seq = noise_seq + ref_seq * references
     text_seq = 512
     num_rope_axes = len(cfg.axes_dims_rope)
 
-    # Position IDs: text (T=0) + noise (T=0) + reference (T=10)
-    img_ids = torch.cat(
-        [
-            _grid_position_ids(noise_grid, noise_grid_h, num_rope_axes),
-            _grid_position_ids(
-                ref_grid, ref_grid_h, num_rope_axes, time_offset=REFERENCE_TOKEN_TIME_OFFSET
-            ),
-        ]
-    ).unsqueeze(0)
+    # Position IDs: text (T=0) + noise (T=0) + reference (T=10) [+ second reference (T=20)]
+    grids = [_grid_position_ids(noise_grid, noise_grid_h, num_rope_axes)]
+    offsets = [REFERENCE_TOKEN_TIME_OFFSET, SECOND_REFERENCE_TOKEN_TIME_OFFSET]
+    for index in range(references):
+        grids.append(
+            _grid_position_ids(ref_grid, ref_grid_h, num_rope_axes, time_offset=offsets[index])
+        )
+    img_ids = torch.cat(grids).unsqueeze(0)
     txt_ids = _text_position_ids(text_seq, num_rope_axes)
 
     return (

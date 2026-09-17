@@ -98,6 +98,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--references",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help=(
+            "With --bundle: 2 adds an img2img2_<size>_<grid> entrypoint per size that takes two "
+            "reference images, and names the bundle …+2ref. Default 1."
+        ),
+    )
+    parser.add_argument(
         "--reference-grid",
         default="half",
         choices=["full", "half", "quarter"],
@@ -265,7 +275,7 @@ def main() -> None:
         from coreai_models.diffusion.components import register_flux2_bundle
 
         try:
-            bundle_keys = register_flux2_bundle(bundle, grids=(args.reference_grid,))
+            bundle_keys = register_flux2_bundle(bundle, grids=(args.reference_grid,), references=args.references)
         except ValueError as why:
             parser.error(str(why))
         args.single_function = True

@@ -57,6 +57,9 @@ public struct Flux2Pipeline: DiffusionPipeline {
     ///
     /// A grid absent from both is simply not supported by the bundle.
     public let img2imgRoutes: [ReferenceGrid: Img2ImgRoute]
+    /// The same for two reference pictures: `img2img2_<size>_<grid>` entrypoints
+    /// of a bundle exported with `--references 2`. Empty otherwise.
+    public let img2img2Routes: [ReferenceGrid: Img2ImgRoute]
     public let textEncoder: CoreAIDiffusionModelFunction
     public let decoder: CoreAIDiffusionModelFunction
     public let encoder: CoreAIDiffusionModelFunction?
@@ -77,6 +80,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
     /// Reference tokens sit at T=10 on RoPE axis 0, separating them from the noise
     /// grid (T=0) where H/W would otherwise collide. Matches the export-time dummies.
     private static let referenceTokenTimeOffset: Float = 10
+    /// A second reference sits at T=20. Matches `SECOND_REFERENCE_TOKEN_TIME_OFFSET`.
+    private static let secondReferenceTokenTimeOffset: Float = 20
 
     /// FLUX.2 flow-matching timestep shift.
     ///
@@ -141,6 +146,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         mode: DecodeResolution = .full,
         transformer: CoreAIDiffusionModelFunction,
         img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:],
+        img2img2Routes: [ReferenceGrid: Img2ImgRoute] = [:],
         textEncoder: CoreAIDiffusionModelFunction,
         decoder: CoreAIDiffusionModelFunction,
         encoder: CoreAIDiffusionModelFunction?,
@@ -155,6 +161,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         self.mode = mode
         self.transformer = transformer
         self.img2imgRoutes = img2imgRoutes
+        self.img2img2Routes = img2img2Routes
         self.textEncoder = textEncoder
         self.decoder = decoder
         self.encoder = encoder
@@ -257,6 +264,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         var referenceTokens: [Float]?
         var refW = 0
         var refH = 0
+        var referenceCount = 0
 
         if isActuallyImg2Img,
             let enc = encoder,
@@ -287,6 +295,22 @@ public struct Flux2Pipeline: DiffusionPipeline {
                     channels: inChannels)
             }
             referenceTokens = refPacked
+            referenceCount = 1
+            // A second picture: encoded the same way, its tokens after the
+            // first's, on a graph traced for two reference grids.
+            if let second = configuration.secondStartingImage {
+                let fullSecond = try await encodeReferenceImage(
+                    encoder: enc, srcImage: second, imageWidth: imageWidth, imageHeight: imageHeight,
+                    gridW: gridW, gridH: gridH, inChannels: inChannels
+                )
+                let secondPacked = (refW == gridW && refH == gridH)
+                    ? fullSecond
+                    : Self.subsampleTokens(
+                        fullSecond, fromW: gridW, fromH: gridH, toW: refW, toH: refH,
+                        channels: inChannels)
+                referenceTokens = refPacked + secondPacked
+                referenceCount = 2
+            }
             if configuration.lazyModelLoading { await enc.unloadResources() }
 
             // FLUX.2 reference-token img2img: noise latents start from PURE NOISE.
@@ -306,13 +330,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
             throw PipelineLoadError.missingConfig(
                 "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
         }
-        let refSeqLen = refW * refH
+        let refSeqLen = refW * refH * referenceCount
         // img2img appends reference tokens after the noise tokens, marked T=10 on axis 0
-        // so the transformer's in-graph RoPE separates them from the noise grid.
+        // (T=20 for a second picture) so the transformer's in-graph RoPE separates them
+        // from the noise grid and from each other.
         let imageIds: [Float]
         if referenceTokens != nil {
             imageIds = buildImageIdsWithReference(
-                noiseW: gridW, noiseH: gridH, refW: refW, refH: refH, axisCount: axisCount)
+                noiseW: gridW, noiseH: gridH, refW: refW, refH: refH, axisCount: axisCount,
+                references: referenceCount)
         } else {
             imageIds = buildImageIds(gridW: gridW, gridH: gridH, axisCount: axisCount)
         }
@@ -328,8 +354,14 @@ public struct Flux2Pipeline: DiffusionPipeline {
         if referenceTokens != nil {
             // Name what the bundle does have, not just what it lacks: re-exporting is the
             // only remedy, so the available set is the actionable part.
-            guard let route = img2imgRoutes[configuration.referenceGrid] else {
-                let available = img2imgRoutes.keys.map(\.rawValue).sorted()
+            let routes = referenceCount == 2 ? img2img2Routes : img2imgRoutes
+            if referenceCount == 2, routes.isEmpty {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "this bundle has no two-reference transformer (img2img2_* entrypoints; "
+                        + "export with --bundle … --references 2).")
+            }
+            guard let route = routes[configuration.referenceGrid] else {
+                let available = routes.keys.map(\.rawValue).sorted()
                 throw PipelineLoadError.unsupportedConfiguration(
                     available.isEmpty
                         ? "this bundle has no img2img transformer. Export the img2img "
@@ -650,11 +682,11 @@ public struct Flux2Pipeline: DiffusionPipeline {
     /// Reference rows carry T=10 on axis 0 so in-graph RoPE keeps them positionally
     /// distinct from the noise grid even where H/W coincide.
     private func buildImageIdsWithReference(
-        noiseW: Int, noiseH: Int, refW: Int, refH: Int, axisCount: Int
+        noiseW: Int, noiseH: Int, refW: Int, refH: Int, axisCount: Int, references: Int = 1
     ) -> [Float] {
         let noiseSeq = noiseW * noiseH
         let refSeq = refW * refH
-        var ids = [Float](repeating: 0, count: (noiseSeq + refSeq) * axisCount)
+        var ids = [Float](repeating: 0, count: (noiseSeq + refSeq * references) * axisCount)
 
         for h in 0..<noiseH {
             for w in 0..<noiseW {
@@ -664,12 +696,15 @@ public struct Flux2Pipeline: DiffusionPipeline {
             }
         }
 
-        for h in 0..<refH {
-            for w in 0..<refW {
-                let idx = noiseSeq + h * refW + w
-                ids[idx * axisCount + 0] = Self.referenceTokenTimeOffset
-                ids[idx * axisCount + 1] = Float(h)
-                ids[idx * axisCount + 2] = Float(w)
+        let offsets = [Self.referenceTokenTimeOffset, Self.secondReferenceTokenTimeOffset]
+        for reference in 0..<references {
+            for h in 0..<refH {
+                for w in 0..<refW {
+                    let idx = noiseSeq + reference * refSeq + h * refW + w
+                    ids[idx * axisCount + 0] = offsets[reference]
+                    ids[idx * axisCount + 1] = Float(h)
+                    ids[idx * axisCount + 2] = Float(w)
+                }
             }
         }
 

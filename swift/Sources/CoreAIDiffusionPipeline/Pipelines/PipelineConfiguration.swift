@@ -72,6 +72,9 @@ public struct PipelineConfiguration: Hashable, Sendable {
 
     // Image-to-image
     public var startingImage: CGImage?
+    /// A second reference picture, for a transformer traced with two
+    /// reference grids (`img2img2_*` entrypoints). Ignored without the first.
+    public var secondStartingImage: CGImage?
     public var strength: Float
     public var referenceGrid: ReferenceGrid
     public var guidanceMode: GuidanceMode

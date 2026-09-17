@@ -215,6 +215,7 @@ extension Flux2Pipeline {
         let transformer: CoreAIDiffusionModelFunction
         let transformerEntry: String
         var routes: [ReferenceGrid: Img2ImgRoute] = [:]
+        var twoReferenceRoutes: [ReferenceGrid: Img2ImgRoute] = [:]
         if let transformerPath = Self.resolveAsset(at: url, name: "Transformer_\(suffix)") {
             transformer = CoreAIDiffusionModelFunction(
                 modelURL: url.appendingPathComponent(transformerPath))
@@ -243,6 +244,10 @@ extension Flux2Pipeline {
                 if names.contains(entry) {
                     routes[grid] = Img2ImgRoute(function: transformer, entrypoint: entry)
                 }
+                let two = "img2img2_\(suffix)_\(grid.rawValue)"
+                if names.contains(two) {
+                    twoReferenceRoutes[grid] = Img2ImgRoute(function: transformer, entrypoint: two)
+                }
             }
         } else {
             throw PipelineLoadError.missingComponent(
@@ -258,6 +263,7 @@ extension Flux2Pipeline {
             mode: .full,
             transformer: transformer,
             img2imgRoutes: routes,
+            img2img2Routes: twoReferenceRoutes,
             textEncoder: CoreAIDiffusionModelFunction(
                 modelURL: url.appendingPathComponent(textEncoderPath)),
             decoder: CoreAIDiffusionModelFunction(

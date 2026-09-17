@@ -20,6 +20,7 @@ from typing import Any, cast
 import torch
 
 from coreai_models.diffusion.flux2 import (
+    dummy_flux2_transformer_img2img2_at,
     Flux2TextEncoderWrapper,
     Flux2TransformerWrapper,
     Flux2VAEDecoderWrapper,
@@ -591,7 +592,7 @@ def flux2_bundle_tag(sizes: Sequence[tuple[int, int]]) -> str:
 
 
 def register_flux2_bundle(
-    sizes: Sequence[tuple[int, int]], grids: Sequence[str] = ("half",)
+    sizes: Sequence[tuple[int, int]], grids: Sequence[str] = ("half",), references: int = 1
 ) -> list[str]:
     """One transformer for several pixel sizes: `Transformer_<w>x<h>+<w>x<h>`.
 
@@ -615,7 +616,10 @@ def register_flux2_bundle(
         if grid not in REFERENCE_GRIDS:
             raise ValueError(f"Unknown reference grid {grid!r}; one of {REFERENCE_GRIDS}.")
 
-    tag = flux2_bundle_tag(sizes)
+    if references not in (1, 2):
+        raise ValueError("A bundle carries one or two reference images per function.")
+    # A two-reference bundle is its own variant, named so: `…+2ref`.
+    tag = flux2_bundle_tag(sizes) + ("+2ref" if references == 2 else "")
     key = f"transformer_bundle_{tag}"
     if key not in FLUX2_COMPONENTS:
         functions: list[FunctionVariant] = []
@@ -630,6 +634,13 @@ def register_flux2_bundle(
                         dummy_flux2_transformer_img2img_at(width, height, grid),
                     )
                 )
+                if references == 2:
+                    functions.append(
+                        FunctionVariant(
+                            f"img2img2_{width}x{height}_{grid}",
+                            dummy_flux2_transformer_img2img2_at(width, height, grid),
+                        )
+                    )
         FLUX2_COMPONENTS[key] = MultiFunctionComponentSpec(
             asset_name=f"Transformer_{tag}",
             input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
