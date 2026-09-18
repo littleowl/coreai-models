@@ -79,6 +79,25 @@ extension Flux2Pipeline {
         public var pixelSize: (width: Int, height: Int) { grid.pixelSize }
     }
 
+    /// Inpainting and outpainting, in latent space: the original encoded at
+    /// the full grid, and per token how much of it to **keep** (1) against
+    /// regenerate (0). After every step the kept tokens are put back as the
+    /// original noised to that step's sigma, so only the masked tokens are
+    /// free to change and the rest arrive exactly where they started. No
+    /// change to the graph: the mask never reaches the transformer. Pass the
+    /// same picture as a reference too, so the model has the context.
+    public struct Inpainting: Sendable {
+        /// The canvas encoded with `encodeReference(_:for:grid: .full)`.
+        public let original: ReferenceTokens
+        /// One value per token of the noise grid, row-major, 0…1.
+        public let keep: [Float]
+
+        public init(original: ReferenceTokens, keep: [Float]) {
+            self.original = original
+            self.keep = keep
+        }
+    }
+
     /// One denoising step landed.
     public struct DenoiseStep: Sendable {
         /// 1-based.
@@ -167,11 +186,22 @@ extension Flux2Pipeline {
         guidanceScale: Float = 1.0,
         unconditional: TextConditioning? = nil,
         seed: UInt32,
+        inpaint: Inpainting? = nil,
         onStep: ((DenoiseStep) async -> Bool)? = nil
     ) async throws -> Latent {
         let grid = Grid(pixels: size)
         let inChannels = Self.latentChannels
         let seqLen = grid.tokens
+        if let inpaint {
+            guard inpaint.original.grid == grid, inpaint.original.tokens.count == seqLen * inChannels else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "the inpainting original must be encoded at the full grid of the picture's size")
+            }
+            guard inpaint.keep.count == seqLen else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "the inpainting mask needs one value per token (\(seqLen)), got \(inpaint.keep.count)")
+            }
+        }
 
         // Reference-token img2img uses the full schedule (1.0 → 0): structure
         // comes from the concatenated reference tokens, not from noise
@@ -182,6 +212,7 @@ extension Flux2Pipeline {
 
         let noise = generateNoise(count: inChannels * seqLen, seed: seed)
         var packedLatents = packLatentsSpatialFlatten(noise, channels: inChannels, height: grid.height, width: grid.width)
+        let initialNoise = packedLatents
 
         // Every reference sits on the same reduced grid; their tokens follow
         // the noise tokens, marked T=10 and T=20 on RoPE's first axis.
@@ -251,6 +282,21 @@ extension Flux2Pipeline {
 
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
             try checkLatentsAreFinite(packedLatents, step: step)
+            if let inpaint {
+                // The kept tokens, put back as the original at the sigma the
+                // sample now sits at: x = (1 − σ)·x₀ + σ·ε, with ε the run's
+                // own starting noise; σ is 0 after the last step.
+                let sigma = scheduler.sigmas[min(step + 1, scheduler.sigmas.count - 1)]
+                for token in 0..<seqLen where inpaint.keep[token] > 0 {
+                    let keep = min(1, inpaint.keep[token])
+                    let base = token * inChannels
+                    for c in 0..<inChannels {
+                        let i = base + c
+                        let kept = (1 - sigma) * inpaint.original.tokens[i] + sigma * initialNoise[i]
+                        packedLatents[i] = keep * kept + (1 - keep) * packedLatents[i]
+                    }
+                }
+            }
 
             if let onStep {
                 let latent = Latent(
