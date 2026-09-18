@@ -111,8 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--open-shape",
         action="store_true",
         help=(
-            "With --shapes: enumerate nothing and leave the token dimension open in the asset "
-            "(Transformer_…_open), to see whether the runtime takes a dynamic sequence as is."
+            "Leave the spatial dimension open instead of enumerating shapes. Alone: exports the "
+            "size-free set — Transformer_open (token axis open), VAEDecoder_open and "
+            "VAEEncoder_open (height and width open) — plus the text encoder; one function "
+            "`main` each, any size whose sides are multiples of 16. With --shapes: the "
+            "transformer named after those sizes, dimension open (Transformer_…_open)."
         ),
     )
     parser.add_argument(
@@ -300,6 +303,18 @@ def main() -> None:
         args.single_function = True
         if not args.components:
             args.components = [bundle_keys[0], "text_encoder", *bundle_keys[1:]]
+
+    if args.open_shape and args.shapes is None and pipeline_type == "flux2":
+        if args.resolution is not None or args.bundle is not None:
+            parser.error("--open-shape alone is the size-free set; do not name sizes with it.")
+        if args.platform:
+            parser.error("--open-shape picks its own components; do not combine it with --platform.")
+        from coreai_models.diffusion.components import register_flux2_open
+
+        open_keys = register_flux2_open(grids=(args.reference_grid,))
+        args.single_function = True
+        if not args.components:
+            args.components = [*open_keys, "text_encoder"]
 
     if args.shapes is not None and pipeline_type == "flux2":
         if args.resolution is not None or args.bundle is not None:

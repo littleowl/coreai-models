@@ -200,8 +200,12 @@ extension Flux2Pipeline {
         tokenizerAt tokenizerRoot: URL
     ) async throws {
         let suffix = "\(size.width)x\(size.height)"
-        guard let decoderPath = Self.resolveAsset(at: url, name: "VAEDecoder_\(suffix)") else {
-            throw PipelineLoadError.missingComponent("VAEDecoder_\(suffix)")
+        // A size's own VAEs, or the open ones (`VAEDecoder_open`, height and
+        // width dynamic), which serve any size.
+        guard let decoderPath = Self.resolveAsset(at: url, name: "VAEDecoder_\(suffix)")
+            ?? Self.resolveAsset(at: url, name: "VAEDecoder_open")
+        else {
+            throw PipelineLoadError.missingComponent("VAEDecoder_\(suffix) or VAEDecoder_open")
         }
         guard let textEncoderPath = descriptor.components.textEncoder else {
             throw PipelineLoadError.missingComponent("text_encoder")
@@ -288,6 +292,7 @@ extension Flux2Pipeline {
         }
 
         let encoderPath = Self.resolveAsset(at: url, name: "VAEEncoder_\(suffix)")
+            ?? Self.resolveAsset(at: url, name: "VAEEncoder_open")
         let tokenizer = try await AutoTokenizer.from(
             modelFolder: tokenizerRoot.appendingPathComponent("tokenizer"))
 
@@ -326,6 +331,7 @@ extension Flux2Pipeline {
     static func shapesAsset(at url: URL, holding suffix: String) -> String? {
         multiSizeAsset(at: url, holding: suffix, kind: "shapes")
             ?? multiSizeAsset(at: url, holding: suffix, kind: "open")
+            ?? resolveAsset(at: url, name: "Transformer_open")  // named after no size at all
     }
 
     /// A transformer named after several sizes joined with `+`, with the

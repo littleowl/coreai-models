@@ -221,7 +221,9 @@ public struct Flux2Pipeline: DiffusionPipeline {
         //
         // The grid is two numbers, not one: an iPad is not square and neither
         // is a coloring page. Everything below counts tokens as gridW * gridH.
-        let (imageWidth, imageHeight) = defaultImageSize
+        // The size the pipeline was opened at, unless this run names its own —
+        // which an open transformer and open VAEs can take.
+        let (imageWidth, imageHeight) = configuration.imageSize ?? defaultImageSize
         let gridW = imageWidth / Self.patchSize
         let gridH = imageHeight / Self.patchSize
         let inChannels = Self.latentChannels

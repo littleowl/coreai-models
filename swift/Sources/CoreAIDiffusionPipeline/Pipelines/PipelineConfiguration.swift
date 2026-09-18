@@ -91,6 +91,12 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var originalSize: Float
     public var targetSize: Float
 
+    /// The picture's size for this run, overriding the size the pipeline was
+    /// opened at — for a pipeline whose transformer and VAEs have their
+    /// dimensions open (`Transformer_open`, `VAEDecoder_open`), which take
+    /// any size whose sides are multiples of 16. Nil for the opened size.
+    public var imageSize: (width: Int, height: Int)? = nil
+
     /// Load model components on demand and unload after each pipeline stage to reduce peak memory.
     /// Disable to keep all models resident and exercise full memory pressure (e.g. profiling peak footprint).
     public var lazyModelLoading: Bool

@@ -44,6 +44,8 @@ from coreai_models.diffusion.flux2 import (
     dummy_flux2_vae_encoder_half,
     flux2_token_counts,
     flux2_transformer_dynamic_shapes,
+    flux2_vae_decoder_dynamic_shapes,
+    flux2_vae_encoder_dynamic_shapes,
     flux2_transformer_static_shapes,
     grid_for,
 )
@@ -726,6 +728,56 @@ def register_flux2_shapes(
         )
     ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
     return [key] + keys
+
+
+def register_flux2_open(grids: Sequence[str] = ("half",)) -> list[str]:
+    """The size-free set: `Transformer_open`, `VAEDecoder_open`, `VAEEncoder_open`.
+
+    Each traced once with its spatial dimension open — the transformer's token
+    axis, the VAEs' height and width — and enumerated for nothing, so one
+    function `main` serves any size whose sides are multiples of 16, either
+    way round, text, one reference or two. What it costs at run time against
+    the specialised files is the measurement (`Docs/klein-bundles.md`).
+    """
+    keys: list[str] = []
+    if "transformer_open" not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS["transformer_open"] = EnumeratedComponentSpec(
+            asset_name="Transformer_open",
+            input_names=_FLUX2_TRANSFORMER_INPUT_NAMES,
+            output_names=("output",),
+            wrapper_fn=lambda p: Flux2TransformerWrapper(p.transformer),
+            dummy_fn=dummy_flux2_transformer_at(768, 576),
+            dynamic_shapes_fn=flux2_transformer_dynamic_shapes,
+            static_shapes_fn=None,
+            quantizable=True,
+        )
+    keys.append("transformer_open")
+    if "vae_decoder_open" not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS["vae_decoder_open"] = EnumeratedComponentSpec(
+            asset_name="VAEDecoder_open",
+            input_names=("z",),
+            output_names=("image",),
+            wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae),
+            dummy_fn=dummy_flux2_vae_decoder_at(768, 576),
+            dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes,
+            static_shapes_fn=None,
+            quantizable=False,
+        )
+    keys.append("vae_decoder_open")
+    if "vae_encoder_open" not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS["vae_encoder_open"] = EnumeratedComponentSpec(
+            asset_name="VAEEncoder_open",
+            input_names=("image",),
+            output_names=("latent_params",),
+            wrapper_fn=lambda p: Flux2VAEEncoderWrapper(p.vae),
+            dummy_fn=dummy_flux2_vae_encoder_at(768, 576),
+            dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes,
+            static_shapes_fn=None,
+            quantizable=False,
+        )
+    keys.append("vae_encoder_open")
+    ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
+    return keys
 
 
 # Multi-function transformer: 8 functions in one .aimodel, shared weights (~2 GB)

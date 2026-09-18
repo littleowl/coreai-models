@@ -495,3 +495,26 @@ def flux2_transformer_static_shapes(token_counts: "Sequence[int]") -> Any:
         }
 
     return shapes
+
+
+def flux2_vae_decoder_dynamic_shapes() -> tuple[dict[int, "torch.export.Dim"] | None, ...]:
+    """The latent's height and width left open: `[1, 32, ?, ?]`."""
+    return (
+        {
+            2: torch.export.Dim("latent_height", min=8, max=512),
+            3: torch.export.Dim("latent_width", min=8, max=512),
+        },
+    )
+
+
+def flux2_vae_encoder_dynamic_shapes() -> tuple[dict[int, "torch.export.Dim"] | None, ...]:
+    """The picture's height and width left open: `[1, 3, ?, ?]`.
+
+    The encoder downsamples by 8, so a side that is not a multiple of 8 would
+    make torch.export guard on the remainder; the pipeline never sends one
+    (every side is a multiple of 16), and the dims are declared in units the
+    export can prove: 8 × an open count.
+    """
+    eight_h = 8 * torch.export.Dim("picture_height_eighths", min=8, max=512)
+    eight_w = 8 * torch.export.Dim("picture_width_eighths", min=8, max=512)
+    return ({2: eight_h, 3: eight_w},)
