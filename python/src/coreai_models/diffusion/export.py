@@ -119,6 +119,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--tiny",
+        action="store_true",
+        help=(
+            "Also export TAEF2, the tiny autoencoder for FLUX.2 (madebyollin/taef2, fetched from "
+            "the Hub): TinyDecoder_open and TinyEncoder_open with --open-shape, and "
+            "TinyDecoder_<size> / TinyEncoder_<size> for a --resolution, --bundle or --shapes size."
+        ),
+    )
+    parser.add_argument(
         "--references",
         type=int,
         default=1,
@@ -304,6 +313,21 @@ def main() -> None:
         if not args.components:
             args.components = [bundle_keys[0], "text_encoder", *bundle_keys[1:]]
 
+    if args.tiny and pipeline_type == "flux2":
+        from coreai_models.diffusion.components import register_flux2_tiny
+
+        tiny_sizes: list[tuple[int, int]] = []
+        if size is not None:
+            tiny_sizes = [size]
+        for named in (args.bundle, args.shapes):
+            if named is not None:
+                tiny_sizes += [s for s in (_resolution_size(p.strip(), parser) for p in str(named).split(",")) if s]
+        tiny_keys = register_flux2_tiny(tiny_sizes)
+        if not args.open_shape:
+            tiny_keys = [k for k in tiny_keys if not k.endswith("_open")]
+    else:
+        tiny_keys = []
+
     if args.open_shape and args.shapes is None and pipeline_type == "flux2":
         if args.resolution is not None or args.bundle is not None:
             parser.error("--open-shape alone is the size-free set; do not name sizes with it.")
@@ -314,7 +338,7 @@ def main() -> None:
         open_keys = register_flux2_open(grids=(args.reference_grid,))
         args.single_function = True
         if not args.components:
-            args.components = [*open_keys, "text_encoder"]
+            args.components = [*open_keys, *tiny_keys, "text_encoder"]
 
     if args.shapes is not None and pipeline_type == "flux2":
         if args.resolution is not None or args.bundle is not None:

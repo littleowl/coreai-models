@@ -27,11 +27,16 @@ extension Flux2Pipeline {
     ///   only the two square entrypoints it was traced with, so every other
     ///   resolution is its own set of assets. Nil picks the square ones by
     ///   `mode`, or the bundle's only size when it holds exactly one.
+    /// - Parameter tinyVAE: decode and encode with TAEF2 (`TinyDecoder_<size>`
+    ///   or `TinyDecoder_open`, and the encoder beside it) instead of the VAE.
+    ///   Its latents are the transformer's own, so the batch-norm statistics
+    ///   are not applied. A size-named bundle only.
     public init(
         from url: URL,
         config: PipelineDescriptor.ConfigSource = .auto,
         mode: DecodeResolution = .auto,
-        size: (width: Int, height: Int)? = nil
+        size: (width: Int, height: Int)? = nil,
+        tinyVAE: Bool = false
     ) async throws {
         let descriptor = try PipelineDescriptor.resolve(at: url, config: config)
 
@@ -51,8 +56,12 @@ extension Flux2Pipeline {
 
         if let wanted {
             try await self.init(
-                from: url, descriptor: descriptor, size: wanted, tokenizerAt: url)
+                from: url, descriptor: descriptor, size: wanted, tokenizerAt: url, tinyVAE: tinyVAE)
             return
+        }
+        if tinyVAE {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "the tiny autoencoder is resolved by size; open the pipeline with a size.")
         }
 
         guard let textEncoderPath = descriptor.components.textEncoder else {
@@ -197,15 +206,18 @@ extension Flux2Pipeline {
         from url: URL,
         descriptor: PipelineDescriptor,
         size: (width: Int, height: Int),
-        tokenizerAt tokenizerRoot: URL
+        tokenizerAt tokenizerRoot: URL,
+        tinyVAE: Bool = false
     ) async throws {
         let suffix = "\(size.width)x\(size.height)"
         // A size's own VAEs, or the open ones (`VAEDecoder_open`, height and
-        // width dynamic), which serve any size.
-        guard let decoderPath = Self.resolveAsset(at: url, name: "VAEDecoder_\(suffix)")
-            ?? Self.resolveAsset(at: url, name: "VAEDecoder_open")
+        // width dynamic), which serve any size — or TAEF2's, when asked.
+        let decoderName = tinyVAE ? "TinyDecoder" : "VAEDecoder"
+        let encoderName = tinyVAE ? "TinyEncoder" : "VAEEncoder"
+        guard let decoderPath = Self.resolveAsset(at: url, name: "\(decoderName)_\(suffix)")
+            ?? Self.resolveAsset(at: url, name: "\(decoderName)_open")
         else {
-            throw PipelineLoadError.missingComponent("VAEDecoder_\(suffix) or VAEDecoder_open")
+            throw PipelineLoadError.missingComponent("\(decoderName)_\(suffix) or \(decoderName)_open")
         }
         guard let textEncoderPath = descriptor.components.textEncoder else {
             throw PipelineLoadError.missingComponent("text_encoder")
@@ -291,8 +303,8 @@ extension Flux2Pipeline {
                 "Transformer_\(suffix), or a bundle or shapes transformer holding \(suffix)")
         }
 
-        let encoderPath = Self.resolveAsset(at: url, name: "VAEEncoder_\(suffix)")
-            ?? Self.resolveAsset(at: url, name: "VAEEncoder_open")
+        let encoderPath = Self.resolveAsset(at: url, name: "\(encoderName)_\(suffix)")
+            ?? Self.resolveAsset(at: url, name: "\(encoderName)_open")
         let tokenizer = try await AutoTokenizer.from(
             modelFolder: tokenizerRoot.appendingPathComponent("tokenizer"))
 
@@ -311,12 +323,14 @@ extension Flux2Pipeline {
             },
             transformerFunctionName: transformerEntry,
             tokenizer: tokenizer,
-            batchNormMean: Flux2Pipeline.loadNpyFloat32(
+            // TAEF2 lives in the transformer's latent space: no statistics.
+            batchNormMean: tinyVAE ? nil : Flux2Pipeline.loadNpyFloat32(
                 url.appendingPathComponent("vae_bn_mean.npy")),
-            batchNormVar: Flux2Pipeline.loadNpyFloat32(
+            batchNormVar: tinyVAE ? nil : Flux2Pipeline.loadNpyFloat32(
                 url.appendingPathComponent("vae_bn_var.npy")),
             batchNormEps: descriptor.batchNormEps ?? 1e-5,
-            pixelSize: size)
+            pixelSize: size,
+            usesTinyVAE: tinyVAE)
     }
 
     /// A bundle transformer that holds this size: `Transformer_<a>+<b>+….aimodel`

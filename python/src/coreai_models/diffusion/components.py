@@ -49,6 +49,10 @@ from coreai_models.diffusion.flux2 import (
     flux2_transformer_static_shapes,
     grid_for,
 )
+from coreai_models.diffusion.flux2_tiny import (
+    tiny_decoder_wrapper,
+    tiny_encoder_wrapper,
+)
 from coreai_models.diffusion.wan import (
     WanTextEncoderWrapper,
     WanTransformerWrapper,
@@ -776,6 +780,55 @@ def register_flux2_open(grids: Sequence[str] = ("half",)) -> list[str]:
             quantizable=False,
         )
     keys.append("vae_encoder_open")
+    ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
+    return keys
+
+
+def register_flux2_tiny(sizes: Sequence[tuple[int, int]] = ()) -> list[str]:
+    """TAEF2 as `TinyDecoder_open` / `TinyEncoder_open` (dimensions open) and,
+    per size given, `TinyDecoder_<w>x<h>` / `TinyEncoder_<w>x<h>`.
+
+    The same input and output names as the VAE components, so a pipeline
+    swaps them in by name; the latents are in the transformer's space, so it
+    skips the batch-norm statistics (see `flux2_tiny`).
+    """
+    keys: list[str] = []
+    if "tiny_decoder_open" not in FLUX2_COMPONENTS:
+        FLUX2_COMPONENTS["tiny_decoder_open"] = EnumeratedComponentSpec(
+            asset_name="TinyDecoder_open",
+            input_names=("z",),
+            output_names=("image",),
+            wrapper_fn=tiny_decoder_wrapper,
+            dummy_fn=dummy_flux2_vae_decoder_at(768, 576),
+            dynamic_shapes_fn=flux2_vae_decoder_dynamic_shapes,
+            static_shapes_fn=None,
+            quantizable=False,
+        )
+        FLUX2_COMPONENTS["tiny_encoder_open"] = EnumeratedComponentSpec(
+            asset_name="TinyEncoder_open",
+            input_names=("image",),
+            output_names=("latent_params",),
+            wrapper_fn=tiny_encoder_wrapper,
+            dummy_fn=dummy_flux2_vae_encoder_at(768, 576),
+            dynamic_shapes_fn=flux2_vae_encoder_dynamic_shapes,
+            static_shapes_fn=None,
+            quantizable=False,
+        )
+    keys += ["tiny_decoder_open", "tiny_encoder_open"]
+    for width, height in sizes:
+        grid_for(width, height)
+        size = f"{width}x{height}"
+        for kind, wrapper, dummy, ins, outs in (
+            ("decoder", tiny_decoder_wrapper, dummy_flux2_vae_decoder_at(width, height), ("z",), ("image",)),
+            ("encoder", tiny_encoder_wrapper, dummy_flux2_vae_encoder_at(width, height), ("image",), ("latent_params",)),
+        ):
+            key = f"tiny_{kind}_{size}"
+            if key not in FLUX2_COMPONENTS:
+                FLUX2_COMPONENTS[key] = ComponentSpec(
+                    asset_name=f"Tiny{kind.capitalize()}_{size}",
+                    input_names=ins, output_names=outs, wrapper_fn=wrapper, dummy_fn=dummy,
+                )
+            keys.append(key)
     ALL_FLUX2_COMPONENTS[:] = list(FLUX2_COMPONENTS.keys())
     return keys
 

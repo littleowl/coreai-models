@@ -497,12 +497,20 @@ def flux2_transformer_static_shapes(token_counts: "Sequence[int]") -> Any:
     return shapes
 
 
+# The largest side an open VAE takes, in eighths: 192 is 1536 pixels, room
+# above the pro tier's 1152. The bound is not free — a first export with 512
+# (4096 pixels) decoded 768x576 at a 3.7 GB peak against 1.5 with the size's
+# own decoder and was killed at 1152x864, which reads as buffers sized for the
+# bound rather than the picture. Measured in `Docs/klein-bundles.md`.
+OPEN_MAX_EIGHTHS = 192
+
+
 def flux2_vae_decoder_dynamic_shapes() -> tuple[dict[int, "torch.export.Dim"] | None, ...]:
     """The latent's height and width left open: `[1, 32, ?, ?]`."""
     return (
         {
-            2: torch.export.Dim("latent_height", min=8, max=512),
-            3: torch.export.Dim("latent_width", min=8, max=512),
+            2: torch.export.Dim("latent_height", min=8, max=OPEN_MAX_EIGHTHS),
+            3: torch.export.Dim("latent_width", min=8, max=OPEN_MAX_EIGHTHS),
         },
     )
 
@@ -515,6 +523,6 @@ def flux2_vae_encoder_dynamic_shapes() -> tuple[dict[int, "torch.export.Dim"] | 
     (every side is a multiple of 16), and the dims are declared in units the
     export can prove: 8 × an open count.
     """
-    eight_h = 8 * torch.export.Dim("picture_height_eighths", min=8, max=512)
-    eight_w = 8 * torch.export.Dim("picture_width_eighths", min=8, max=512)
+    eight_h = 8 * torch.export.Dim("picture_height_eighths", min=8, max=OPEN_MAX_EIGHTHS)
+    eight_w = 8 * torch.export.Dim("picture_width_eighths", min=8, max=OPEN_MAX_EIGHTHS)
     return ({2: eight_h, 3: eight_w},)

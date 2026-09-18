@@ -69,6 +69,9 @@ public struct Flux2Pipeline: DiffusionPipeline {
     public let batchNormMean: [Float]?
     public let batchNormVar: [Float]?
     public let batchNormEps: Float
+    /// The decoder and encoder are TAEF2, the tiny autoencoder, whose latents
+    /// are already in the transformer's space — so no batch-norm statistics.
+    public let usesTinyVAE: Bool
 
     // MARK: - Architecture Constants
 
@@ -155,7 +158,8 @@ public struct Flux2Pipeline: DiffusionPipeline {
         batchNormMean: [Float]?,
         batchNormVar: [Float]?,
         batchNormEps: Float,
-        pixelSize: (width: Int, height: Int)? = nil
+        pixelSize: (width: Int, height: Int)? = nil,
+        usesTinyVAE: Bool = false
     ) {
         self.descriptor = descriptor
         self.mode = mode
@@ -171,6 +175,7 @@ public struct Flux2Pipeline: DiffusionPipeline {
         self.batchNormVar = batchNormVar
         self.batchNormEps = batchNormEps
         self.pixelSize = pixelSize
+        self.usesTinyVAE = usesTinyVAE
 
         if tokenizer.convertTokenToId("<|endoftext|>") == nil {
             CLILogger.log(
