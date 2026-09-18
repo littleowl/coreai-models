@@ -105,6 +105,11 @@ extension Flux2Pipeline {
         public let totalSteps: Int
         /// The latent after this step; the last step's is what `denoise` returns.
         public let latent: Latent
+        /// The model's estimate of the finished picture at this step,
+        /// x₀ = x_t − σ·v — what a preview decodes. The latent itself is
+        /// still mostly noise until the last step; decoded, it looks like
+        /// coloured static. After the last step the two are the same.
+        public let estimate: Latent
     }
 
     // MARK: - Encode
@@ -280,6 +285,8 @@ extension Flux2Pipeline {
                 output = referenceTokens == nil ? full : Array(full[0..<(seqLen * inChannels)])
             }
 
+            let sigma = scheduler.sigmas[step]
+            let sample = packedLatents
             packedLatents = scheduler.step(output: output, timeStep: t, sample: packedLatents)
             try checkLatentsAreFinite(packedLatents, step: step)
             if let inpaint {
@@ -302,7 +309,22 @@ extension Flux2Pipeline {
                 let latent = Latent(
                     values: unpackLatentsSpatialFlatten(packedLatents, channels: inChannels, height: grid.height, width: grid.width),
                     grid: grid)
-                let goOn = await onStep(DenoiseStep(step: step + 1, totalSteps: steps, latent: latent))
+                // Flow matching: x_t = (1 − σ)·x₀ + σ·ε and v = ε − x₀, so x₀ = x_t − σ·v.
+                var estimated = sample
+                for i in 0..<estimated.count { estimated[i] -= sigma * output[i] }
+                if let inpaint {
+                    for token in 0..<seqLen where inpaint.keep[token] > 0 {
+                        let keep = min(1, inpaint.keep[token])
+                        let base = token * inChannels
+                        for c in 0..<inChannels {
+                            estimated[base + c] = keep * inpaint.original.tokens[base + c] + (1 - keep) * estimated[base + c]
+                        }
+                    }
+                }
+                let estimate = Latent(
+                    values: unpackLatentsSpatialFlatten(estimated, channels: inChannels, height: grid.height, width: grid.width),
+                    grid: grid)
+                let goOn = await onStep(DenoiseStep(step: step + 1, totalSteps: steps, latent: latent, estimate: estimate))
                 if !goOn { throw CancellationError() }
             }
         }
