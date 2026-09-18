@@ -214,10 +214,20 @@ extension Flux2Pipeline {
         // width dynamic), which serve any size — or TAEF2's, when asked.
         let decoderName = tinyVAE ? "TinyDecoder" : "VAEDecoder"
         let encoderName = tinyVAE ? "TinyEncoder" : "VAEEncoder"
-        guard let decoderPath = Self.resolveAsset(at: url, name: "\(decoderName)_\(suffix)")
-            ?? Self.resolveAsset(at: url, name: "\(decoderName)_open")
-        else {
-            throw PipelineLoadError.missingComponent("\(decoderName)_\(suffix) or \(decoderName)_open")
+        // …or, failing both, the 512-pixel tile decoder (`VAEDecoder_half`)
+        // run over the picture in tiles: the full VAE's output at any size,
+        // memory bounded by the tile.
+        var decodeMode: DecodeResolution = .full
+        var decoderPath: String
+        if let own = Self.resolveAsset(at: url, name: "\(decoderName)_\(suffix)")
+            ?? Self.resolveAsset(at: url, name: "\(decoderName)_open") {
+            decoderPath = own
+        } else if !tinyVAE, let tile = Self.resolveAsset(at: url, name: "VAEDecoder_half") {
+            decoderPath = tile
+            decodeMode = .tiled
+        } else {
+            throw PipelineLoadError.missingComponent(
+                "\(decoderName)_\(suffix), \(decoderName)_open or VAEDecoder_half")
         }
         guard let textEncoderPath = descriptor.components.textEncoder else {
             throw PipelineLoadError.missingComponent("text_encoder")
@@ -310,7 +320,7 @@ extension Flux2Pipeline {
 
         self.init(
             descriptor: descriptor,
-            mode: .full,
+            mode: decodeMode,
             transformer: transformer,
             img2imgRoutes: routes,
             img2img2Routes: twoReferenceRoutes,

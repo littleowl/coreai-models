@@ -245,7 +245,10 @@ public struct Flux2Pipeline: DiffusionPipeline {
         // half-resolution VAE encoder (traced for 512×512), but the reference is
         // encoded at the full image size — feeding it a 1024 image crashes on a
         // shape mismatch. Fail early with a clear message instead.
-        if isActuallyImg2Img && mode == .tiled {
+        // A size-named pipeline encodes the reference with the size's own or the
+        // open encoder and only *decodes* in tiles, so the objection is the square
+        // export's alone.
+        if isActuallyImg2Img && mode == .tiled && pixelSize == nil {
             throw PipelineLoadError.unsupportedConfiguration(
                 "img2img is not supported with tiled decode. Use --decode-resolution full or half.")
         }
@@ -1004,11 +1007,19 @@ public struct Flux2Pipeline: DiffusionPipeline {
     }
 
     /// Tiled VAE decode: split latents into a grid of tiles, decode each with the half-res VAE, blend overlaps.
+    /// The latent side of one decode tile: `VAEDecoder_half`'s input, 512 pixels.
+    static let tileLatentSize = 64
+
     private func decodeTiled(
         latents: [Float], channels: Int, height: Int, width: Int,
         decoder: CoreAIDiffusionModelFunction, outputScale: Int
     ) async throws -> [Float] {
-        let tileSize = height / 2
+        // The tile is the decoder's fixed input — `VAEDecoder_half` takes a
+        // 64 × 64 latent, a 512-pixel square — not a fraction of the picture,
+        // so any size decodes through it: a picture smaller than a tile on a
+        // side is padded by clamping (`extractTile`), a larger one is covered
+        // by tiles with the last one pulled back to the edge (`tileStarts`).
+        let tileSize = Self.tileLatentSize
         let overlap = 4
         let stride = tileSize - overlap
 
