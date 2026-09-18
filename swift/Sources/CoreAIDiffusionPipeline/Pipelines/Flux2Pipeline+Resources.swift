@@ -315,6 +315,12 @@ extension Flux2Pipeline {
 
         let encoderPath = Self.resolveAsset(at: url, name: "\(encoderName)_\(suffix)")
             ?? Self.resolveAsset(at: url, name: "\(encoderName)_open")
+        // TAEF2's decoder beside the VAE, for previews, when it is here and
+        // is not already the decoder.
+        let previewPath = tinyVAE
+            ? nil
+            : Self.resolveAsset(at: url, name: "TinyDecoder_\(suffix)")
+                ?? Self.resolveAsset(at: url, name: "TinyDecoder_open")
         let tokenizer = try await AutoTokenizer.from(
             modelFolder: tokenizerRoot.appendingPathComponent("tokenizer"))
 
@@ -340,7 +346,10 @@ extension Flux2Pipeline {
                 url.appendingPathComponent("vae_bn_var.npy")),
             batchNormEps: descriptor.batchNormEps ?? 1e-5,
             pixelSize: size,
-            usesTinyVAE: tinyVAE)
+            usesTinyVAE: tinyVAE,
+            previewDecoder: previewPath.map {
+                CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent($0))
+            })
     }
 
     /// A bundle transformer that holds this size: `Transformer_<a>+<b>+….aimodel`
